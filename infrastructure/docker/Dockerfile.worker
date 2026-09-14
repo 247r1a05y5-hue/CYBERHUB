@@ -1,0 +1,26 @@
+# ── Worker Dockerfile ─────────────────────────────────────────────────────────
+FROM python:3.11-slim AS base
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libmagic1 \
+    gcc \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+RUN mkdir -p /app/storage /app/quarantine
+
+HEALTHCHECK --interval=15s --timeout=5s --retries=3 \
+    CMD python -c "import redis, os; r=redis.from_url(os.environ.get('REDIS_URL','redis://redis:6379/0')); r.ping()" || exit 1
+
+CMD ["python", "-m", "app.workers.worker"]

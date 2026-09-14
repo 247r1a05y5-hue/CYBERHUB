@@ -1,0 +1,176 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,300;0,14..32,400;0,14..32,500;0,14..32,600;0,14..32,700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ─────────────────────────────────────────────────────────────
+   CYBERHUB DESIGN TOKENS — Pure Black Monochrome Forensics Base
+   Zero blue, zero warm tones, neutral grayscale with restrained semantic accents.
+───────────────────────────────────────────────────────────── */
+:root {
+  /* ── shadcn CSS variable set (Monochrome Base) ── */
+  --background: 0 0% 0%;             /* #000000 */
+  --foreground: 0 0% 96%;             /* #F5F5F5 */
+  --card: 0 0% 5%;                   /* #0C0C0C */
+  --card-foreground: 0 0% 96%;        /* #F5F5F5 */
+  --popover: 0 0% 7%;                /* #111111 */
+  --popover-foreground: 0 0% 96%;     /* #F5F5F5 */
+  --primary: 0 0% 96%;               /* #F5F5F5 (Solid White Action) */
+  --primary-foreground: 0 0% 0%;     /* #000000 (Black text on primary) */
+  --secondary: 0 0% 10%;             /* #1A1A1A */
+  --secondary-foreground: 0 0% 96%;  /* #F5F5F5 */
+  --muted: 0 0% 8%;                  /* #151515 */
+  --muted-foreground: 0 0% 47%;      /* #777777 */
+  --accent: 0 0% 10%;                /* #1A1A1A */
+  --accent-foreground: 0 0% 96%;     /* #F5F5F5 */
+  --destructive: 0 65% 55%;          /* #ef4444 (Restrained Red) */
+  --destructive-foreground: 0 0% 98%;
+  --border: 0 0% 10%;                /* #1A1A1A */
+  --input: 0 0% 10%;                 /* #1A1A1A */
+  --ring: 0 0% 30%;                  /* #4D4D4D */
+  --radius: 0.5rem;                  /* 8px restrained radius */
+
+  /* ── shadcn chart tokens (monochrome + subtle semantic) ── */
+  --chart-1: 0 0% 96%;
+  --chart-2: 0 0% 70%;
+  --chart-3: 0 0% 47%;
+  --chart-4: 142 60% 45%;
+  --chart-5: 0 65% 55%;
+
+  /* ── CyberHub Layer Tokens ── */
+  --bg:              #000000;
+  --bg-secondary:    #080808;
+  --surface:         #0C0C0C;
+  --surface-raised:  #111111;
+  --surface-hover:   #1A1A1A;
+  --header-bg:       #000000;
+  --sidebar-bg:      #000000;
+  --search-bg:       #0C0C0C;
+  --search-border:   #1A1A1A;
+  --control-bg:      #111111;
+  --control-border:  #232323;
+  --icon-box-bg:     #151515;
+  --icon-box-border: #232323;
+  --icon-color:      #B3B3B3;
+  --border-strong:   #2B2B2B;
+  --divider:         #1A1A1A;
+
+  /* ── Text Hierarchy ── */
+  --text-primary:    #F5F5F5;
+  --text-secondary:  #B3B3B3;
+  --text-tertiary:   #777777;
+  --text-disabled:   #4A4A4A;
+
+  /* ── Semantic Accents (Restrained) ── */
+  --status-active:   #10B981;
+  --status-pending:  #F59E0B;
+  --status-draft:    #777777;
+  --card-shadow:     none;
+  --card-shadow-hover: none;
+
+  /* ── Investigation-state tokens ── */
+  --state-discovered:    0 0% 50%;
+  --state-candidate:     0 0% 70%;
+  --state-verified:      142 60% 45%;
+  --state-rejected:      0 65% 55%;
+  --state-uncertain:     38 80% 50%;
+}
+
+.dark, [data-theme="dark"] {
+  --background: 0 0% 0%;
+  --foreground: 0 0% 96%;
+  --card: 0 0% 5%;
+  --card-foreground: 0 0% 96%;
+  --popover: 0 0% 7%;
+  --popover-foreground: 0 0% 96%;
+  --primary: 0 0% 96%;
+  --primary-foreground: 0 0% 0%;
+  --secondary: 0 0% 10%;
+  --secondary-foreground: 0 0% 96%;
+  --muted: 0 0% 8%;
+  --muted-foreground: 0 0% 47%;
+  --accent: 0 0% 10%;
+  --accent-foreground: 0 0% 96%;
+  --destructive: 0 65% 55%;
+  --destructive-foreground: 0 0% 98%;
+  --border: 0 0% 10%;
+  --input: 0 0% 10%;
+  --ring: 0 0% 30%;
+
+  --bg:              #000000;
+  --bg-secondary:    #080808;
+  --surface:         #0C0C0C;
+  --surface-raised:  #111111;
+  --surface-hover:   #1A1A1A;
+  --header-bg:       #000000;
+  --sidebar-bg:      #000000;
+  --search-bg:       #0C0C0C;
+  --search-border:   #1A1A1A;
+  --control-bg:      #111111;
+  --control-border:  #232323;
+  --icon-box-bg:     #151515;
+  --icon-box-border: #232323;
+  --icon-color:      #B3B3B3;
+  --border-strong:   #2B2B2B;
+  --divider:         #1A1A1A;
+
+  --text-primary:    #F5F5F5;
+  --text-secondary:  #B3B3B3;
+  --text-tertiary:   #777777;
+  --text-disabled:   #4A4A4A;
+
+  --state-discovered:    0 0% 50%;
+  --state-candidate:     0 0% 70%;
+  --state-verified:      142 60% 45%;
+  --state-rejected:      0 65% 55%;
+  --state-uncertain:     38 80% 50%;
+}
+
+/* ─────────────────────────────────────────────────────────────
+   Base Reset & Typography
+───────────────────────────────────────────────────────────── */
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 13px;
+  line-height: 1.5;
+  background-color: #000000;
+  color: #F5F5F5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+code, pre, kbd, .font-mono {
+  font-family: 'JetBrains Mono', monospace;
+}
+
+/* ─────────────────────────────────────────────────────────────
+   Custom Scrollbars (Graphite & Pure Black)
+───────────────────────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+::-webkit-scrollbar-track {
+  background: #000000;
+}
+::-webkit-scrollbar-thumb {
+  background: #232323;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #383838;
+}

@@ -1,0 +1,133 @@
+/* CinematicScrollVideo styling — Pinned sticky video viewport */
+
+.cinematic-scroll-section {
+  position: relative;
+  height: 400vh;
+  background-color: #080c14;
+  /* Prevent horizontal overflow during motion */
+  overflow-x: clip;
+}
+
+.cinematic-sticky-frame {
+  position: sticky;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+  background-color: #080c14;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+}
+
+/* Video element — single source of truth, completely unmodified */
+.cinematic-video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: center;
+  pointer-events: none;
+  user-select: none;
+  opacity: 1;
+  transition: opacity 0.3s ease-out;
+  will-change: transform;
+}
+
+.cinematic-video.is-loading {
+  opacity: 0;
+}
+
+/* Loading state placeholder / fallback */
+.cinematic-fallback-bg {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(circle at 50% 50%, #0f172a 0%, #080c14 100%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1;
+}
+
+/* Dark ambient vignette overlay to keep text and UI readable without altering video source */
+.cinematic-ambient-vignette {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(circle at center, transparent 35%, rgba(8, 12, 20, 0.6) 80%, rgba(8, 12, 20, 0.92) 100%);
+  pointer-events: none;
+  z-index: 2;
+}
+
+.cinematic-gradient-top {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 160px;
+  background: linear-gradient(180deg, rgba(8, 12, 20, 0.85) 0%, transparent 100%);
+  pointer-events: none;
+  z-index: 3;
+}
+
+.cinematic-gradient-bottom {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 200px;
+  background: linear-gradient(0deg, rgba(8, 12, 20, 0.95) 0%, transparent 100%);
+  pointer-events: none;
+  z-index: 3;
+}
+
+/* Text Overlay — distinct DOM layer never touching the video pixels */
+.cinematic-hero-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 0 1.5rem;
+  z-index: 12;
+  pointer-events: auto;
+  will-change: transform, opacity;
+  transition: opacity 0.1s linear;
+}
+
+/* Scroll Scrubbing Progress Bar Indicator at bottom */
+.cinematic-timeline-indicator {
+  position: absolute;
+  bottom: 2rem;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+  z-index: 15;
+  pointer-events: none;
+}
+
+.cinematic-progress-track {
+  width: 140px;
+  height: 2px;
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 9999px;
+  overflow: hidden;
+  position: relative;
+}
+
+.cinematic-progress-bar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  width: 100%;
+  background: #3b82f6;
+  transform-origin: left center;
+  transform: scaleX(calc(var(--video-progress, 0)));
+  will-change: transform;
+}

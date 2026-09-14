@@ -1,0 +1,291 @@
+/* ══════════════════════════════════════════════════════════════════
+   ImageExposureOverlay — Cinematic Image Exposure Visualization
+   Layer order (bottom→top): video → dark-gradient → THIS LAYER → navbar → hero
+   ══════════════════════════════════════════════════════════════════ */
+
+/* ─── Overlay root ─────────────────────────────────────────────── */
+.iev-root {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 6; /* between vignette(2) and hero-overlay(12) */
+  overflow: hidden;
+}
+
+/* ─── Investigation line (SVG) ─────────────────────────────────── */
+.iev-lines-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.iev-line {
+  stroke: rgba(56, 189, 248, 0.45);
+  stroke-width: 0.8;
+  stroke-dasharray: 6 5;
+  fill: none;
+  opacity: 0;
+}
+
+.iev-line-a {
+  animation: iev-line-draw 1.6s ease-out 6s forwards;
+}
+.iev-line-b {
+  animation: iev-line-draw 1.4s ease-out 12s forwards;
+}
+.iev-line-c {
+  animation: iev-line-draw 1.2s ease-out 13.5s forwards;
+}
+
+@keyframes iev-line-draw {
+  from { opacity: 0; stroke-dashoffset: 120; }
+  to   { opacity: 1; stroke-dashoffset: 0; }
+}
+
+/* ─── Pulse dot on line terminus ───────────────────────────────── */
+.iev-dot {
+  fill: rgba(56, 189, 248, 0.9);
+  opacity: 0;
+}
+.iev-dot-a { animation: iev-dot-in 0.5s ease-out 7.4s forwards; }
+.iev-dot-b { animation: iev-dot-in 0.5s ease-out 13.2s forwards; }
+.iev-dot-c { animation: iev-dot-in 0.5s ease-out 14.6s forwards; }
+
+@keyframes iev-dot-in {
+  from { opacity: 0; r: 0; }
+  to   { opacity: 1; r: 3; }
+}
+
+/* ─── Image tile base ──────────────────────────────────────────── */
+.iev-tile {
+  position: absolute;
+  border: 1px solid rgba(56, 189, 248, 0.18);
+  background: rgba(8, 12, 22, 0.55);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border-radius: 6px;
+  padding: 10px 12px;
+  opacity: 0;
+  box-shadow:
+    0 0 0 1px rgba(56, 189, 248, 0.06),
+    0 4px 32px rgba(0, 0, 0, 0.55),
+    inset 0 0 12px rgba(56, 189, 248, 0.04);
+}
+
+/* ─── Reference tile (appears first, 3–6s) ────────────────────── */
+.iev-tile-ref {
+  top: 54%;
+  left: 14%;
+  width: 148px;
+  animation: iev-tile-enter 1.2s var(--ease-out, cubic-bezier(0,0,0.2,1)) 3s forwards;
+}
+
+/* ─── Primary match card (9–12s, slightly forward/larger) ───────── */
+.iev-tile-primary {
+  top: 28%;
+  left: 58%;
+  width: 172px;
+  animation: iev-tile-enter 1.4s var(--ease-out, cubic-bezier(0,0,0.2,1)) 9s forwards;
+  border-color: rgba(56, 189, 248, 0.28);
+  box-shadow:
+    0 0 0 1px rgba(56, 189, 248, 0.12),
+    0 0 28px rgba(56, 189, 248, 0.08),
+    0 8px 40px rgba(0, 0, 0, 0.7),
+    inset 0 0 16px rgba(56, 189, 248, 0.06);
+}
+
+/* ─── Secondary exposure tiles (12–16s) ────────────────────────── */
+.iev-tile-sec-a {
+  top: 22%;
+  left: 22%;
+  width: 110px;
+  animation: iev-tile-enter-soft 1.4s var(--ease-out, cubic-bezier(0,0,0.2,1)) 12s forwards;
+}
+.iev-tile-sec-b {
+  top: 68%;
+  left: 65%;
+  width: 100px;
+  animation: iev-tile-enter-soft 1.6s var(--ease-out, cubic-bezier(0,0,0.2,1)) 13s forwards;
+}
+.iev-tile-sec-c {
+  top: 42%;
+  left: 80%;
+  width: 106px;
+  animation: iev-tile-enter-soft 1.8s var(--ease-out, cubic-bezier(0,0,0.2,1)) 14.5s forwards;
+}
+
+/* ─── Entry keyframes ───────────────────────────────────────────── */
+@keyframes iev-tile-enter {
+  0%   { opacity: 0; transform: scale(0.88) translateY(10px); }
+  60%  { opacity: 0.85; }
+  100% { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+@keyframes iev-tile-enter-soft {
+  0%   { opacity: 0; transform: scale(0.92) translateY(6px); }
+  100% { opacity: 0.72; transform: scale(1) translateY(0); }
+}
+
+/* ─── Label typography ──────────────────────────────────────────── */
+.iev-label-tag {
+  display: block;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: rgba(56, 189, 248, 0.7);
+  margin-bottom: 4px;
+}
+
+.iev-label-title {
+  display: block;
+  font-family: 'Inter', sans-serif;
+  font-size: 11px;
+  font-weight: 600;
+  color: rgba(244, 244, 245, 0.95);
+  letter-spacing: 0.02em;
+  line-height: 1.3;
+  margin-bottom: 6px;
+}
+
+.iev-label-sub {
+  display: block;
+  font-family: 'Inter', sans-serif;
+  font-size: 10px;
+  color: rgba(113, 113, 122, 0.9);
+  letter-spacing: 0.01em;
+  line-height: 1.4;
+}
+
+.iev-divider {
+  height: 1px;
+  background: rgba(255, 255, 255, 0.06);
+  margin: 6px 0;
+}
+
+/* ─── Signal bar (animated) ─────────────────────────────────────── */
+.iev-signal-bar-track {
+  height: 2px;
+  width: 100%;
+  background: rgba(255, 255, 255, 0.07);
+  border-radius: 9999px;
+  overflow: hidden;
+  margin-top: 6px;
+}
+
+.iev-signal-bar-fill {
+  height: 100%;
+  border-radius: 9999px;
+  background: linear-gradient(90deg, rgba(56,189,248,0.7) 0%, rgba(99,102,241,0.5) 100%);
+  transform-origin: left center;
+  transform: scaleX(0);
+  animation: iev-signal-grow 1.6s ease-out 11s forwards;
+}
+
+@keyframes iev-signal-grow {
+  from { transform: scaleX(0); }
+  to   { transform: scaleX(0.72); }
+}
+
+/* ─── Verify action chip ────────────────────────────────────────── */
+.iev-verify-chip {
+  display: inline-block;
+  margin-top: 7px;
+  padding: 2px 8px;
+  border: 1px solid rgba(56, 189, 248, 0.25);
+  border-radius: 3px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: rgba(56, 189, 248, 0.8);
+  background: rgba(56, 189, 248, 0.05);
+  opacity: 0;
+  animation: iev-chip-in 0.6s ease-out 11.8s forwards;
+}
+
+@keyframes iev-chip-in {
+  from { opacity: 0; transform: translateY(3px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ─── Pulsing glow ring on primary card ────────────────────────── */
+.iev-glow-ring {
+  position: absolute;
+  inset: -1px;
+  border-radius: 7px;
+  border: 1px solid rgba(56, 189, 248, 0.0);
+  pointer-events: none;
+  animation: iev-ring-pulse 3s ease-in-out 10s infinite;
+}
+
+@keyframes iev-ring-pulse {
+  0%   { border-color: rgba(56, 189, 248, 0.0);  box-shadow: 0 0 0px rgba(56, 189, 248, 0); }
+  50%  { border-color: rgba(56, 189, 248, 0.22); box-shadow: 0 0 16px rgba(56, 189, 248, 0.12); }
+  100% { border-color: rgba(56, 189, 248, 0.0);  box-shadow: 0 0 0px rgba(56, 189, 248, 0); }
+}
+
+/* ─── Status indicator dot ──────────────────────────────────────── */
+.iev-status-dot {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: rgba(56, 189, 248, 0.85);
+  margin-right: 5px;
+  vertical-align: middle;
+  animation: iev-dot-pulse 2.4s ease-in-out 10s infinite;
+}
+
+@keyframes iev-dot-pulse {
+  0%, 100% { opacity: 0.4; }
+  50%       { opacity: 1; box-shadow: 0 0 6px rgba(56, 189, 248, 0.6); }
+}
+
+/* ─── Mobile adjustments ────────────────────────────────────────── */
+@media (max-width: 640px) {
+  .iev-tile-ref {
+    top: 60%;
+    left: 6%;
+    width: 118px;
+    font-size: 90%;
+  }
+  .iev-tile-primary {
+    top: 22%;
+    left: 52%;
+    width: 132px;
+  }
+  .iev-tile-sec-a,
+  .iev-tile-sec-b,
+  .iev-tile-sec-c {
+    display: none; /* reduce clutter on mobile */
+  }
+  .iev-line-b,
+  .iev-line-c {
+    display: none;
+  }
+}
+
+/* ─── Reduced motion — collapse all animations ──────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  .iev-tile,
+  .iev-tile-ref,
+  .iev-tile-primary,
+  .iev-tile-sec-a,
+  .iev-tile-sec-b,
+  .iev-tile-sec-c {
+    animation: none !important;
+    opacity: 0 !important; /* keep overlay hidden — do not flash static content */
+  }
+  .iev-line,
+  .iev-dot,
+  .iev-signal-bar-fill,
+  .iev-verify-chip,
+  .iev-glow-ring,
+  .iev-status-dot {
+    animation: none !important;
+    opacity: 0 !important;
+  }
+}

@@ -1,0 +1,29 @@
+# ── CyberHub Background Worker (RQ Worker Service) ─────────────────────────
+FROM python:3.11-slim AS base
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
+
+WORKDIR /app
+
+# System dependencies for asyncpg, psycopg2, python-magic, and image hashing
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libmagic1 \
+    gcc \
+    libpq-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy backend source code
+COPY . .
+
+# Create persistent storage directories
+RUN mkdir -p /app/storage /app/quarantine
+
+# Run RQ worker entrypoint
+CMD ["python", "-m", "app.workers.worker"]

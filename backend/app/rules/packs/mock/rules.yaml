@@ -1,0 +1,70 @@
+name: "mock_threat_rules"
+version: "1.2.0"
+description: "Core deterministic rules for detecting common security threat patterns"
+
+rules:
+  - id: "RULE-MOCK-001"
+    name: "Web Shell & Command Injection Signatures"
+    description: "Detects system command execution functions commonly used in web shells and reverse shells"
+    severity: "critical"
+    weight: 45.0
+    condition_logic: "ANY"
+    conditions:
+      - field: "payload"
+        operator: "contains"
+        value: ["cmd.exe", "/bin/sh", "/bin/bash", "eval(", "passthru(", "shell_exec("]
+      - field: "payload"
+        operator: "regex"
+        value: "(powershell.*-enc|nc\\s+-e\\s+/bin)"
+    tags: ["injection", "webshell", "rce"]
+
+  - id: "RULE-MOCK-002"
+    name: "Credential Harvesting / Phishing Keywords"
+    description: "Detects typical phishing language requesting urgent credential verification"
+    severity: "high"
+    weight: 35.0
+    condition_logic: "ALL"
+    conditions:
+      - field: "payload"
+        operator: "contains"
+        value: ["verify your account", "password reset", "urgent action required"]
+      - field: "payload"
+        operator: "regex"
+        value: "(login|signin|banking|account-update)"
+    tags: ["phishing", "social_engineering"]
+
+  - id: "RULE-MOCK-003"
+    name: "Suspicious Dynamic DNS / High-Risk TLD"
+    description: "Detects URLs pointing to high-risk free TLDs or dynamic DNS providers"
+    severity: "medium"
+    weight: 20.0
+    condition_logic: "ANY"
+    conditions:
+      - field: "payload"
+        operator: "regex"
+        value: "https?://[^/]+\\.(xyz|top|work|buzz|duckdns\\.org|ngrok\\.io)"
+    tags: ["network", "dns", "tld"]
+
+  - id: "RULE-MOCK-004"
+    name: "SQL Injection Patterns"
+    description: "Detects common SQL injection syntax and tautologies"
+    severity: "high"
+    weight: 30.0
+    condition_logic: "ANY"
+    conditions:
+      - field: "payload"
+        operator: "regex"
+        value: "('\\s*OR\\s*'1'='1|UNION\\s+SELECT|--\\s*$|;\\s*DROP\\s+TABLE)"
+    tags: ["sqli", "owasp-top-10"]
+
+  - id: "RULE-MOCK-005"
+    name: "High Entropy Encoded String"
+    description: "Detects large blocks of base64 or hex that suggest obfuscated payload delivery"
+    severity: "medium"
+    weight: 15.0
+    condition_logic: "ANY"
+    conditions:
+      - field: "payload"
+        operator: "regex"
+        value: "[A-Za-z0-9+/]{80,}={0,2}"
+    tags: ["obfuscation", "encoding"]
