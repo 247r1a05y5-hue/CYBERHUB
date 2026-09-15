@@ -190,6 +190,7 @@ async def record_attestation(
     }
 
 
+@router.post("/{investigation_id}/reference", status_code=status.HTTP_201_CREATED)
 @router.post("/{investigation_id}/reference-image", status_code=status.HTTP_201_CREATED)
 async def upload_reference_image(
     investigation_id: uuid.UUID,
@@ -544,6 +545,7 @@ class WebSearchRequest(BaseModel):
     include_similar: bool = True
 
 
+@router.post("/{investigation_id}/search", status_code=status.HTTP_200_OK)
 @router.post("/{investigation_id}/web-search", status_code=status.HTTP_200_OK)
 async def execute_web_search(
     investigation_id: uuid.UUID,
@@ -622,12 +624,26 @@ async def execute_web_search(
             image_url=temp_url,
             options=options,
         )
+    except ValueError as val_err:
+        logger.error(f"Search provider reachability error: {val_err}")
+        return {
+            "investigation_id": str(case.id),
+            "provider": provider_name,
+            "provider_status": "REFERENCE_IMAGE_NOT_EXTERNALLY_REACHABLE",
+            "error_code": "REFERENCE_IMAGE_NOT_EXTERNALLY_REACHABLE",
+            "results_count": 0,
+            "candidates": [],
+            "status": "REFERENCE_IMAGE_NOT_EXTERNALLY_REACHABLE",
+            "message": str(val_err),
+            "remediation": "Configure PUBLIC_BASE_URL to a valid public HTTPS domain (e.g. Railway, Cloudflare, or ngrok) so SearchAPI crawlers can access the temporary reference image.",
+        }
     except PermissionError as auth_err:
         logger.error(f"Search provider auth error: {auth_err}")
         return {
             "investigation_id": str(case.id),
             "provider": provider_name,
             "provider_status": "PROVIDER_AUTH_ERROR",
+            "error_code": "PROVIDER_AUTH_ERROR",
             "results_count": 0,
             "candidates": [],
             "status": "PROVIDER_AUTH_ERROR",
@@ -639,6 +655,7 @@ async def execute_web_search(
             "investigation_id": str(case.id),
             "provider": provider_name,
             "provider_status": "PROVIDER_QUOTA_EXCEEDED",
+            "error_code": "PROVIDER_QUOTA_EXCEEDED",
             "results_count": 0,
             "candidates": [],
             "status": "PROVIDER_QUOTA_EXCEEDED",
@@ -650,6 +667,7 @@ async def execute_web_search(
             "investigation_id": str(case.id),
             "provider": provider_name,
             "provider_status": "PROVIDER_TIMEOUT",
+            "error_code": "PROVIDER_TIMEOUT",
             "results_count": 0,
             "candidates": [],
             "status": "PROVIDER_TIMEOUT",
@@ -872,6 +890,7 @@ async def stream_investigation_events(
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
+@router.get("/{investigation_id}/results")
 @router.get("/{investigation_id}/findings")
 async def get_findings_and_clusters(
     investigation_id: uuid.UUID,
@@ -1122,6 +1141,7 @@ async def get_evidence_vault(
     }
 
 
+@router.post("/{investigation_id}/results/{finding_id}/verify")
 @router.post("/{investigation_id}/findings/{finding_id}/verify")
 async def verify_finding(
     investigation_id: uuid.UUID,

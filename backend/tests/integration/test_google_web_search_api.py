@@ -106,6 +106,10 @@ class TestGoogleWebSearchAPI:
 
         # 4. Call POST /api/v1/investigations/{id}/web-search
         with patch.object(
+            provider_orchestrator.searchapi_provider,
+            "discover",
+            return_value=mock_discoveries,
+        ), patch.object(
             provider_orchestrator.google_provider,
             "discover",
             return_value=mock_discoveries,
@@ -117,7 +121,7 @@ class TestGoogleWebSearchAPI:
             )
             assert search_res.status_code == 200, search_res.text
             data = search_res.json()
-            assert data["provider"] == "GoogleCloudVision"
+            assert data["provider"] in ("GoogleCloudVision", "SearchAPIGoogleLens")
             assert data["results_count"] == 2
             assert len(data["candidates"]) == 2
             assert data["best_guess_labels"] == ["Executive Portrait"]
@@ -137,7 +141,7 @@ class TestGoogleWebSearchAPI:
         assert findings_res.status_code == 200, findings_res.text
         findings_data = findings_res.json()
         assert findings_data["total_findings"] == 2
-        assert findings_data["findings"][0]["provider"] == "GoogleCloudVision"
+        assert findings_data["findings"][0]["provider"] in ("GoogleCloudVision", "SearchAPIGoogleLens")
 
     async def test_web_search_without_reference_image_fails(
         self,

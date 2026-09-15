@@ -193,10 +193,13 @@ class GoogleVisionWebDetectionProvider(ImageDiscoveryProvider):
         client = self._get_client()
         if client:
             try:
-                from google.cloud import vision
+                try:
+                    from google.cloud import vision
+                    v_image = vision.Image(content=image_bytes)
+                except ImportError:
+                    v_image = {"content": image_bytes}
 
                 def _call_vision_sync() -> Any:
-                    v_image = vision.Image(content=image_bytes)
                     return client.web_detection(image=v_image, max_results=options.max_results)
 
                 response = await asyncio.to_thread(_call_vision_sync)
@@ -536,6 +539,22 @@ class SearchAPIGoogleLensProvider(ImageDiscoveryProvider):
             logger.error("SearchAPI Google Lens requires a valid image URL or image bytes.")
             return []
 
+        # Validate that the target image URL is externally reachable for SearchAPI crawlers
+        parsed_target = urllib.parse.urlparse(target_url)
+        target_host = (parsed_target.hostname or "").lower()
+        if (
+            target_host in ("localhost", "127.0.0.1", "0.0.0.0", "::1")
+            or target_host.endswith(".local")
+            or target_host.endswith(".internal")
+        ):
+            logger.error(
+                f"Cannot dispatch SearchAPI request: target URL '{target_url}' is not externally reachable."
+            )
+            raise ValueError(
+                "REFERENCE_IMAGE_NOT_EXTERNALLY_REACHABLE: Search provider requires an externally reachable HTTPS image URL. "
+                "PUBLIC_BASE_URL is currently configured with a local/private address."
+            )
+
         logger.info(
             f"SearchAPI Google Lens request dispatched: "
             f"target_url={target_url}, engine={self.engine}, max_results={options.max_results}"
@@ -574,7 +593,7 @@ class SearchAPIGoogleLensProvider(ImageDiscoveryProvider):
             self.circuit_breaker.record_failure()
             logger.error(f"SearchAPI Timeout after {options.timeout_seconds}s: {timeout_err}")
             raise TimeoutError(f"PROVIDER_TIMEOUT: SearchAPI request timed out: {timeout_err}") from timeout_err
-        except (PermissionError, RuntimeError, TimeoutError):
+        except (PermissionError, RuntimeError, TimeoutError, ValueError):
             raise
         except Exception as err:
             self.circuit_breaker.record_failure()
@@ -670,7 +689,43 @@ class SearchAPIGoogleLensProvider(ImageDiscoveryProvider):
                         )
                     )
 
-        # 3. Knowledge Graph & Related Searches
+        # 3. Reverse Image Search (Pages with matching images / source pages)
+        rev_search = data.get("reverse_image_search", {})
+        if isinstance(rev_search, dict):
+            pages = rev_search.get("pages_with_matching_images", [])
+            if isinstance(pages, list):
+                for item in pages:
+                    if not isinstance(item, dict):
+                        continue
+                    link = item.get("link") or item.get("url") or ""
+                    title = item.get("title") or "Source Page"
+                    img_url = item.get("thumbnail") or item.get("image") or link
+                    domain = item.get("source") or (urllib.parse.urlparse(link).netloc if link else "unknown")
+                    snippet = item.get("snippet") or ""
+
+                    if link or img_url:
+                        results.append(
+                            NormalizedDiscoveryResult(
+                                provider=self.name,
+                                source_url=link or img_url,
+                                page_url=link or img_url,
+                                image_url=img_url or link,
+                                domain=domain,
+                                page_title=title,
+                                discovered_at=datetime.now(timezone.utc),
+                                provider_score=0.90,
+                                provider_raw_ref="reverse_image_search_pages",
+                                c2pa_status=None,
+                                metadata={
+                                    "match_type": "SOURCE_PAGE",
+                                    "snippet": snippet,
+                                    "thumbnail_url": img_url,
+                                    "search_id": search_id,
+                                },
+                            )
+                        )
+
+        # 4. Knowledge Graph & Related Searches
         knowledge_graph = data.get("knowledge_graph", [])
         if isinstance(knowledge_graph, list):
             for item in knowledge_graph:

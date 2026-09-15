@@ -67,7 +67,7 @@ class Settings(BaseSettings):
             if not self.database_url or "sqlite" in self.database_url.lower():
                 raise ValueError(
                     "CRITICAL CONFIGURATION ERROR: PostgreSQL DATABASE_URL is strictly mandatory in production mode. "
-                    "SQLite fallback is strictly prohibited."
+                    "SQLite database URL is strictly prohibited in production mode."
                 )
             if self.allow_sqlite_fallback:
                 raise ValueError(

@@ -14,8 +14,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from jose import JWTError, jwt
-from pwdlib import PasswordHash
-from pwdlib.hashers.argon2 import Argon2Hasher
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
 
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -23,7 +23,7 @@ from app.core.logging import get_logger
 logger = get_logger(__name__)
 
 # ── Password hashing ──────────────────────────────────────────────────────────
-_hasher = PasswordHash([Argon2Hasher()])
+_hasher = PasswordHasher()
 
 
 def hash_password(password: str) -> str:
@@ -34,8 +34,8 @@ def hash_password(password: str) -> str:
 def verify_password(plain: str, hashed: str) -> bool:
     """Verify a plain password against a stored Argon2id hash."""
     try:
-        return _hasher.verify(plain, hashed)
-    except Exception:
+        return _hasher.verify(hashed, plain)
+    except (VerifyMismatchError, Exception):
         return False
 
 

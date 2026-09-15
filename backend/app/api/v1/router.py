@@ -10,6 +10,7 @@ from app.api.v1.endpoints.auth import router as auth_router
 from app.api.v1.endpoints.cases import router as cases_router
 from app.api.v1.endpoints.dashboard import router as dashboard_router
 from app.api.v1.endpoints.datasets import router as datasets_router
+from app.api.v1.endpoints.diagnostics import router as diagnostics_router
 from app.api.v1.endpoints.evidence import router as evidence_router
 from app.api.v1.endpoints.health import router as health_router
 from app.api.v1.endpoints.image_investigations import router as image_investigations_router
@@ -23,9 +24,12 @@ from app.api.v1.endpoints.users import router as users_router
 
 api_router = APIRouter()
 
+# System & Search Diagnostics
+api_router.include_router(diagnostics_router, prefix="/system/diagnostics", tags=["diagnostics"])
+api_router.include_router(diagnostics_router, prefix="/diagnostics", tags=["diagnostics"])
+
 # Ephemeral Temporary Images (For External SearchAPI Google Lens Crawlers)
 api_router.include_router(temp_images_router, prefix="/temp-images", tags=["temp-images"])
-
 
 # Health
 api_router.include_router(health_router, prefix="/health", tags=["health"])

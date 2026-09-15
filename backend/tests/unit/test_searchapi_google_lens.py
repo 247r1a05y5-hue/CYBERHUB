@@ -95,7 +95,7 @@ async def test_searchapi_successful_response(sample_searchapi_response):
     with patch("httpx.AsyncClient.get", return_value=mock_resp):
         results = await prov.discover(
             image_bytes=b"sample_test_image_bytes_123",
-            image_url=None,
+            image_url="https://images.example.com/investigations/ref_image_123.jpg",
             options=ProviderOptions(max_results=10),
         )
 
