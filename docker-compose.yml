@@ -55,7 +55,7 @@ services:
   api:
     build:
       context: ./backend
-      dockerfile: ../infrastructure/docker/Dockerfile.backend
+      dockerfile: Dockerfile
     restart: unless-stopped
     environment:
       APP_ENV: ${APP_ENV:-development}
@@ -74,6 +74,11 @@ services:
       QUARANTINE_ROOT: /app/quarantine
       MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-52428800}
       LOGIN_RATE_LIMIT: ${LOGIN_RATE_LIMIT:-10/minute}
+      SEARCHAPI_API_KEY: ${SEARCHAPI_API_KEY:-}
+      SEARCHAPI_ENGINE: ${SEARCHAPI_ENGINE:-google_lens}
+      SEARCHAPI_ENABLED: ${SEARCHAPI_ENABLED:-true}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8000}
+      ALLOW_TEST_MOCK_PROVIDER: ${ALLOW_TEST_MOCK_PROVIDER:-false}
     volumes:
       - ./backend:/app
       - app_storage:/app/storage
@@ -86,7 +91,7 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')\""]
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -98,7 +103,7 @@ services:
   worker:
     build:
       context: ./backend
-      dockerfile: ../infrastructure/docker/Dockerfile.worker
+      dockerfile: Dockerfile.worker
     restart: unless-stopped
     environment:
       APP_ENV: ${APP_ENV:-development}
@@ -111,6 +116,8 @@ services:
       RQ_QUEUE_NAME: ${RQ_QUEUE_NAME:-analysis}
       STORAGE_ROOT: /app/storage
       QUARANTINE_ROOT: /app/quarantine
+      SEARCHAPI_API_KEY: ${SEARCHAPI_API_KEY:-}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8000}
     volumes:
       - ./backend:/app
       - app_storage:/app/storage
@@ -127,7 +134,9 @@ services:
   frontend:
     build:
       context: ./frontend
-      dockerfile: ../infrastructure/docker/Dockerfile.frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
     restart: unless-stopped
     ports:
       - "3000:80"
@@ -135,7 +144,7 @@ services:
       api:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost/health || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost/ || exit 1"]
       interval: 10s
       timeout: 3s
       retries: 5
