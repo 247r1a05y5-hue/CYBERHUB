@@ -70,7 +70,9 @@ Thumbs.db
 # ── Uploads / Storage ─────────────────────────────────────────────────────────
 uploads/
 quarantine/
-storage/
+/storage/
+backend/storage/
+!backend/app/storage/
 
 # ── Reports (generated) ───────────────────────────────────────────────────────
 reports/output/
