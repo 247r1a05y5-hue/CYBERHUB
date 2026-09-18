@@ -5,7 +5,7 @@ import logging
 import sys
 
 import redis
-from rq import Connection, Queue, Worker
+from rq import Queue, Worker
 
 from app.core.config import get_settings
 
@@ -19,10 +19,10 @@ listen = ["analyses", "reports", "default"]
 def main() -> None:
     logger.info("Initializing Cyber Platform RQ Worker...")
     conn = redis.from_url(settings.REDIS_URL)
-    with Connection(conn):
-        worker = Worker(map(Queue, listen))
-        logger.info(f"Worker listening on queues: {listen}")
-        worker.work(with_scheduler=True)
+    worker = Worker(listen, connection=conn)
+    logger.info(f"Worker listening on queues: {listen}")
+    worker.work(with_scheduler=True)
+
 
 
 if __name__ == "__main__":

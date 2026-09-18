@@ -1,12 +1,13 @@
-"""External Search Provider Abstraction & Orchestration Layer.
+"""External Search Provider Abstraction, Normalization & Deduplication Layer.
 
-Locked Strategy:
-- PRIMARY: Google Cloud Vision — Web Detection (Real Adapter)
-- SECONDARY: TinEye API / MatchEngine (Real Adapter)
-- TEST HARNESS: DeterministicMockProvider (strictly guarded for test suites)
-- Explicit Provider Status: NOT_CONFIGURED, READY, RUNNING, SUCCEEDED, FAILED, DEGRADED, RATE_LIMITED
-- Circuit Breaker: Tracks consecutive failures and trips to degraded state
-- Normalization: Retains full provider provenance and metadata
+Phase 2 Architecture:
+- Provider 1: SearchAPI Google Lens (`SEARCHAPI_API_KEY`)
+- Provider 2: SerpApi Google Lens (`SERPAPI_API_KEY`)
+- Parallel Execution: Runs both providers concurrently without cross-blocking
+- Robust Backoff & Retry: Bounded exponential backoff for transient errors, fail-fast on 401/403, 429 rate-limit handling
+- Normalization: Single unified NormalizedDiscoveryResult schema preserving provenance
+- Cross-Provider Deduplication: Merges identical public pages/images into single records retaining all provider references
+- Tenant Isolation: Scoped to requesting organization
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ import base64
 import enum
 import logging
 import os
+import random
 import time
 import urllib.parse
 from dataclasses import dataclass, field
@@ -40,33 +42,78 @@ class ProviderStatus(str, enum.Enum):
     RATE_LIMITED = "RATE_LIMITED"
 
 
-@dataclass(frozen=True)
+class ProviderHealthState(str, enum.Enum):
+    """Fine-grained health status."""
+    CONFIGURED = "configured"
+    MISSING_CREDENTIALS = "missing_credentials"
+    REACHABLE = "reachable"
+    AUTHENTICATION_FAILED = "authentication_failed"
+    RATE_LIMITED = "rate_limited"
+    TIMEOUT = "timeout"
+    PARSER_ERROR = "parser_error"
+    PROVIDER_ERROR = "provider_error"
+    NO_RESULTS = "no_results"
+
+
+class ResultType(str, enum.Enum):
+    EXACT_MATCH = "EXACT_MATCH"
+    VISUAL_MATCH = "VISUAL_MATCH"
+    RELATED = "RELATED"
+    OTHER = "OTHER"
+
+
+@dataclass
 class NormalizedDiscoveryResult:
-    """Standardized discovery signal returned by an external search provider."""
-    provider: str
-    page_url: str
-    image_url: str
-    domain: str
-    page_title: str
-    discovered_at: datetime
-    provider_score: float
-    provider_raw_ref: str
+    """Unified normalized result schema across all search providers."""
+    provider: str  # "SearchAPI" | "SerpApi"
+    provider_result_id: str | None
+    title: str | None
+    source: str | None  # domain / source name
+    result_url: str
+    image_url: str | None
+    thumbnail_url: str | None
+    position: int | None
+    result_type: str = "VISUAL_MATCH"  # EXACT_MATCH, VISUAL_MATCH, RELATED, OTHER
+    provider_metadata: dict[str, Any] = field(default_factory=dict)
+    discovered_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    # Backward compatibility fields for existing API & clustering consumers
+    page_url: str = ""
     source_url: str = ""
+    domain: str = ""
+    page_title: str = ""
+    provider_score: float = 0.85
+    provider_raw_ref: str = ""
     c2pa_status: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if not self.page_url:
+            self.page_url = self.result_url
         if not self.source_url:
-            object.__setattr__(self, "source_url", self.page_url or self.image_url)
+            self.source_url = self.result_url
+        if not self.domain:
+            if self.source:
+                self.domain = self.source
+            elif self.result_url:
+                parsed = urllib.parse.urlparse(self.result_url)
+                self.domain = parsed.netloc or "unknown"
+        if not self.page_title and self.title:
+            self.page_title = self.title
+        if not self.metadata:
+            self.metadata = dict(self.provider_metadata)
+        elif not self.provider_metadata:
+            self.provider_metadata = dict(self.metadata)
 
 
 @dataclass
 class ProviderOptions:
     """Configurable execution parameters for provider calls."""
-    max_results: int = 25
+    max_results: int = 50
     include_similar: bool = True
     timeout_seconds: float = 15.0
     safe_search: bool = True
+    max_retries: int = 3
 
 
 class CircuitBreaker:
@@ -76,13 +123,12 @@ class CircuitBreaker:
         self,
         failure_threshold: int = 3,
         recovery_timeout_seconds: float = 60.0,
-        recovery_time_seconds: float | None = None,
     ) -> None:
         self.failure_threshold = failure_threshold
-        self.recovery_timeout_seconds = recovery_time_seconds if recovery_time_seconds is not None else recovery_timeout_seconds
+        self.recovery_timeout_seconds = recovery_timeout_seconds
         self.consecutive_failures = 0
         self.last_failure_time: float | None = None
-        self.state: str = "CLOSED"  # CLOSED (healthy), OPEN (degraded), HALF_OPEN
+        self.state: str = "CLOSED"  # CLOSED, OPEN, HALF_OPEN
 
     def record_success(self) -> None:
         self.consecutive_failures = 0
@@ -108,6 +154,74 @@ class CircuitBreaker:
         return True  # HALF_OPEN
 
 
+async def _dispatch_with_retry(
+    client: httpx.AsyncClient,
+    endpoint: str,
+    params: dict[str, Any],
+    provider_name: str,
+    timeout_seconds: float = 15.0,
+    max_retries: int = 3,
+) -> tuple[int, dict[str, Any], dict[str, str]]:
+    """
+    Common resilient HTTP dispatch with parity across SearchAPI and SerpApi:
+    - Fail fast on 401/403 (Authentication Error) without retry
+    - Handle 429 Rate Limit (Respect Retry-After header)
+    - Exponential backoff with jitter on 5xx / Network timeouts
+    - Mask API key in all log messages
+    """
+    last_err: Exception | None = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            resp = await client.get(endpoint, params=params, timeout=timeout_seconds)
+            headers = dict(resp.headers)
+
+            if resp.status_code in (401, 403):
+                logger.error(f"{provider_name} Authentication Error ({resp.status_code}): Invalid or missing API key.")
+                raise PermissionError(f"PROVIDER_AUTH_ERROR: {provider_name} returned HTTP {resp.status_code}")
+
+            if resp.status_code == 429:
+                retry_after_str = headers.get("retry-after")
+                retry_after_sec = float(retry_after_str) if retry_after_str and retry_after_str.isdigit() else 2.0
+                logger.warning(f"{provider_name} Rate/Quota Limit (HTTP 429). Retry-After: {retry_after_sec}s.")
+                if attempt < max_retries:
+                    await asyncio.sleep(min(retry_after_sec, 5.0))
+                    continue
+                raise RuntimeError(f"PROVIDER_QUOTA_EXCEEDED: {provider_name} monthly quota or rate limit reached.")
+
+            if resp.status_code >= 500:
+                logger.warning(f"{provider_name} Server Error (HTTP {resp.status_code}) on attempt {attempt + 1}/{max_retries + 1}.")
+                if attempt < max_retries:
+                    backoff = (0.5 * (2 ** attempt)) + (random.random() * 0.2)
+                    await asyncio.sleep(backoff)
+                    continue
+                raise RuntimeError(f"PROVIDER_SERVER_ERROR: {provider_name} returned HTTP {resp.status_code}")
+
+            if resp.status_code != 200:
+                logger.error(f"{provider_name} HTTP {resp.status_code}: {resp.text[:200]}")
+                raise RuntimeError(f"PROVIDER_ERROR: {provider_name} returned HTTP {resp.status_code}")
+
+            try:
+                data = resp.json()
+            except Exception as parse_err:
+                raise ValueError(f"PROVIDER_PARSER_ERROR: Failed to parse {provider_name} JSON response: {parse_err}") from parse_err
+
+            return resp.status_code, data, headers
+
+        except (httpx.TimeoutException, httpx.NetworkError) as net_err:
+            last_err = net_err
+            logger.warning(f"{provider_name} Network/Timeout error on attempt {attempt + 1}: {net_err}")
+            if attempt < max_retries:
+                backoff = (0.5 * (2 ** attempt)) + (random.random() * 0.2)
+                await asyncio.sleep(backoff)
+                continue
+            raise TimeoutError(f"PROVIDER_TIMEOUT: {provider_name} request timed out after {max_retries + 1} attempts") from net_err
+
+    if last_err:
+        raise last_err
+    raise RuntimeError(f"PROVIDER_DISPATCH_FAILED: {provider_name} failed after {max_retries + 1} attempts")
+
+
 class ImageDiscoveryProvider(abc.ABC):
     """Abstract base class for all image discovery / reverse search providers."""
 
@@ -129,376 +243,18 @@ class ImageDiscoveryProvider(abc.ABC):
         pass
 
 
-class GoogleVisionWebDetectionProvider(ImageDiscoveryProvider):
-    """Google Cloud Vision — Official Web Detection Client Adapter via Application Default Credentials (ADC)."""
-
-    def __init__(self, api_key: str | None = None) -> None:
-        super().__init__("GoogleCloudVision")
-        self.api_key = api_key or getattr(settings, "GOOGLE_VISION_API_KEY", None) or os.getenv("GOOGLE_VISION_API_KEY")
-        self.endpoint = "https://vision.googleapis.com/v1/images:annotate"
-        self._client: Any | None = None
-        self._client_init_attempted: bool = False
-        self._has_adc_credentials: bool | None = None
-
-    def _get_client(self) -> Any | None:
-        """Lazily initialize official Google Cloud Vision ImageAnnotatorClient via ADC."""
-        if not self._client_init_attempted:
-            self._client_init_attempted = True
-            try:
-                import google.auth
-                from google.cloud import vision
-
-                credentials, project = google.auth.default()
-                if credentials:
-                    self._client = vision.ImageAnnotatorClient(credentials=credentials)
-                    self._has_adc_credentials = True
-                    logger.info(f"Google Cloud Vision client initialized via ADC (project: {project or 'cyberhub-508511'})")
-            except Exception as err:
-                logger.debug(f"Google Cloud Vision ADC client initialization notice: {err}")
-                self._client = None
-                self._has_adc_credentials = False
-        return self._client
-
-    def get_status(self) -> ProviderStatus:
-        if not self.circuit_breaker.allow_request():
-            return ProviderStatus.DEGRADED
-
-        client = self._get_client()
-        if client or self.api_key:
-            return ProviderStatus.READY
-        return ProviderStatus.NOT_CONFIGURED
-
-    async def discover(
-        self,
-        image_bytes: bytes,
-        image_url: str | None,
-        options: ProviderOptions,
-    ) -> list[NormalizedDiscoveryResult]:
-        """Query Google Cloud Vision Web Detection using actual stored reference image bytes."""
-        status = self.get_status()
-        if status == ProviderStatus.NOT_CONFIGURED:
-            logger.info("Google Cloud Vision provider not configured (ADC / API key not found); skipping.")
-            return []
-
-        if status == ProviderStatus.DEGRADED or not self.circuit_breaker.allow_request():
-            logger.warning("Google Cloud Vision circuit breaker is OPEN; request degraded.")
-            return []
-
-        logger.info(
-            f"Google Cloud Vision Web Detection request dispatched: "
-            f"image_size={len(image_bytes)} bytes, max_results={options.max_results}"
-        )
-
-        # 1. Primary path: Official Google Cloud Vision Client library (ADC)
-        client = self._get_client()
-        if client:
-            try:
-                try:
-                    from google.cloud import vision
-                    v_image = vision.Image(content=image_bytes)
-                except ImportError:
-                    v_image = {"content": image_bytes}
-
-                def _call_vision_sync() -> Any:
-                    return client.web_detection(image=v_image, max_results=options.max_results)
-
-                response = await asyncio.to_thread(_call_vision_sync)
-
-                if response.error.message:
-                    self.circuit_breaker.record_failure()
-                    logger.error(f"Google Cloud Vision Web Detection API returned error: {response.error.message}")
-                    return []
-
-                self.circuit_breaker.record_success()
-                return self._parse_vision_response(response.web_detection, options)
-            except Exception as err:
-                self.circuit_breaker.record_failure()
-                logger.error(f"Google Cloud Vision Web Detection client call failed: {err}")
-                # If API key fallback is not configured, exit
-                if not self.api_key:
-                    return []
-
-        # 2. REST API Key Fallback if ADC client call was not viable
-        if self.api_key:
-            return await self._discover_via_rest(image_bytes, options)
-
-        return []
-
-    def _parse_vision_response(
-        self,
-        web_detection: Any,
-        options: ProviderOptions,
-    ) -> list[NormalizedDiscoveryResult]:
-        """Normalize protobuf or dict WebDetection response from Google Cloud Vision."""
-        results: list[NormalizedDiscoveryResult] = []
-        if not web_detection:
-            logger.info("Google Cloud Vision returned empty webDetection payload.")
-            return []
-
-        # Extract entities and best guess labels for provenance enrichment
-        web_entities = [
-            {
-                "entity_id": str(getattr(e, "entity_id", "") or (e.get("entityId") if isinstance(e, dict) else "")),
-                "description": str(getattr(e, "description", "") or (e.get("description") if isinstance(e, dict) else "")),
-                "score": float(getattr(e, "score", 0.0) or (e.get("score") if isinstance(e, dict) else 0.0)),
-            }
-            for e in (getattr(web_detection, "web_entities", []) or (web_detection.get("webEntities") if isinstance(web_detection, dict) else []))
-            if getattr(e, "description", "") or (isinstance(e, dict) and e.get("description"))
-        ]
-
-        best_guess_labels = [
-            str(getattr(b, "label", "") or (b.get("label") if isinstance(b, dict) else ""))
-            for b in (getattr(web_detection, "best_guess_labels", []) or (web_detection.get("bestGuessLabels") if isinstance(web_detection, dict) else []))
-            if getattr(b, "label", "") or (isinstance(b, dict) and b.get("label"))
-        ]
-
-        shared_meta = {
-            "web_entities": web_entities,
-            "best_guess_labels": best_guess_labels,
-        }
-
-        # 1. Full Matching Images
-        full_matches = getattr(web_detection, "full_matching_images", []) or (web_detection.get("fullMatchingImages") if isinstance(web_detection, dict) else [])
-        for item in full_matches:
-            url = getattr(item, "url", "") or (item.get("url") if isinstance(item, dict) else "")
-            if url:
-                domain = urllib.parse.urlparse(url).netloc or "unknown"
-                results.append(
-                    NormalizedDiscoveryResult(
-                        provider=self.name,
-                        source_url=url,
-                        page_url=url,
-                        image_url=url,
-                        domain=domain,
-                        page_title=f"Full Matching Image ({domain})",
-                        discovered_at=datetime.now(timezone.utc),
-                        provider_score=1.0,
-                        provider_raw_ref="full_matching_images",
-                        c2pa_status=None,
-                        metadata={"match_type": "FULL_MATCH", **shared_meta},
-                    )
-                )
-
-        # 2. Partial Matching Images
-        partial_matches = getattr(web_detection, "partial_matching_images", []) or (web_detection.get("partialMatchingImages") if isinstance(web_detection, dict) else [])
-        for item in partial_matches:
-            url = getattr(item, "url", "") or (item.get("url") if isinstance(item, dict) else "")
-            if url:
-                domain = urllib.parse.urlparse(url).netloc or "unknown"
-                results.append(
-                    NormalizedDiscoveryResult(
-                        provider=self.name,
-                        source_url=url,
-                        page_url=url,
-                        image_url=url,
-                        domain=domain,
-                        page_title=f"Partial Matching Image ({domain})",
-                        discovered_at=datetime.now(timezone.utc),
-                        provider_score=0.9,
-                        provider_raw_ref="partial_matching_images",
-                        c2pa_status=None,
-                        metadata={"match_type": "PARTIAL_MATCH", **shared_meta},
-                    )
-                )
-
-        # 3. Pages with Matching Images
-        pages = getattr(web_detection, "pages_with_matching_images", []) or (web_detection.get("pagesWithMatchingImages") if isinstance(web_detection, dict) else [])
-        for page in pages:
-            p_url = getattr(page, "url", "") or (page.get("url") if isinstance(page, dict) else "")
-            title = getattr(page, "page_title", "") or (page.get("pageTitle") if isinstance(page, dict) else "") or f"Page match on {urllib.parse.urlparse(p_url).netloc}"
-            domain = urllib.parse.urlparse(p_url).netloc or "unknown"
-            score = float(getattr(page, "score", 0.85) or (page.get("score") if isinstance(page, dict) else 0.85))
-
-            img_url = p_url
-            full_imgs = getattr(page, "full_matching_images", []) or (page.get("fullMatchingImages") if isinstance(page, dict) else [])
-            part_imgs = getattr(page, "partial_matching_images", []) or (page.get("partialMatchingImages") if isinstance(page, dict) else [])
-            if full_imgs:
-                first = full_imgs[0]
-                img_url = getattr(first, "url", "") or (first.get("url") if isinstance(first, dict) else p_url)
-            elif part_imgs:
-                first = part_imgs[0]
-                img_url = getattr(first, "url", "") or (first.get("url") if isinstance(first, dict) else p_url)
-
-            results.append(
-                NormalizedDiscoveryResult(
-                    provider=self.name,
-                    source_url=p_url,
-                    page_url=p_url,
-                    image_url=img_url,
-                    domain=domain,
-                    page_title=title,
-                    discovered_at=datetime.now(timezone.utc),
-                    provider_score=score,
-                    provider_raw_ref="pages_with_matching_images",
-                    c2pa_status=None,
-                    metadata={"match_type": "PAGE_MATCH", "page_score": score, **shared_meta},
-                )
-            )
-
-        # 4. Visually Similar Images
-        if options.include_similar:
-            sim_images = getattr(web_detection, "visually_similar_images", []) or (web_detection.get("visuallySimilarImages") if isinstance(web_detection, dict) else [])
-            for sim in sim_images:
-                sim_url = getattr(sim, "url", "") or (sim.get("url") if isinstance(sim, dict) else "")
-                if sim_url:
-                    domain = urllib.parse.urlparse(sim_url).netloc or "unknown"
-                    results.append(
-                        NormalizedDiscoveryResult(
-                            provider=self.name,
-                            source_url=sim_url,
-                            page_url=sim_url,
-                            image_url=sim_url,
-                            domain=domain,
-                            page_title=f"Visually Similar Image ({domain})",
-                            discovered_at=datetime.now(timezone.utc),
-                            provider_score=0.75,
-                            provider_raw_ref="visually_similar_images",
-                            c2pa_status=None,
-                            metadata={"match_type": "VISUALLY_SIMILAR", **shared_meta},
-                        )
-                    )
-
-        logger.info(
-            f"Google Cloud Vision Web Detection normalized {len(results)} candidate results "
-            f"({len(web_entities)} entities, {len(best_guess_labels)} labels)"
-        )
-        return results
-
-    async def _discover_via_rest(
-        self,
-        image_bytes: bytes,
-        options: ProviderOptions,
-    ) -> list[NormalizedDiscoveryResult]:
-        """REST fallback when API key is provided."""
-        b64_content = base64.b64encode(image_bytes).decode("utf-8")
-        payload = {
-            "requests": [
-                {
-                    "image": {"content": b64_content},
-                    "features": [{"type": "WEB_DETECTION", "maxResults": options.max_results}],
-                }
-            ]
-        }
-
-        try:
-            async with httpx.AsyncClient(timeout=options.timeout_seconds) as client:
-                resp = await client.post(
-                    f"{self.endpoint}?key={self.api_key}",
-                    json=payload,
-                    headers={"Content-Type": "application/json"},
-                )
-
-            if resp.status_code == 429:
-                self.circuit_breaker.record_failure()
-                logger.error("Google Vision REST API rate limited (HTTP 429).")
-                return []
-
-            if resp.status_code != 200:
-                self.circuit_breaker.record_failure()
-                logger.error(f"Google Vision REST API returned HTTP {resp.status_code}: {resp.text[:200]}")
-                return []
-
-            self.circuit_breaker.record_success()
-            data = resp.json()
-            web_detection = data.get("responses", [{}])[0].get("webDetection", {})
-            return self._parse_vision_response(web_detection, options)
-        except Exception as err:
-            self.circuit_breaker.record_failure()
-            logger.error(f"Google Vision REST API call failed: {err}")
-            return []
-
-
-class TinEyeMatchEngineProvider(ImageDiscoveryProvider):
-    """TinEye API / MatchEngine Adapter."""
-
-    def __init__(self, api_key: str | None = None) -> None:
-        super().__init__("TinEye")
-        self.api_key = api_key or getattr(settings, "TINEYE_API_KEY", None) or os.getenv("TINEYE_API_KEY")
-        self.endpoint = "https://api.tineye.com/rest/search/"
-
-    def get_status(self) -> ProviderStatus:
-        if not self.api_key:
-            return ProviderStatus.NOT_CONFIGURED
-        if not self.circuit_breaker.allow_request():
-            return ProviderStatus.DEGRADED
-        return ProviderStatus.READY
-
-    async def discover(
-        self,
-        image_bytes: bytes,
-        image_url: str | None,
-        options: ProviderOptions,
-    ) -> list[NormalizedDiscoveryResult]:
-        if not self.api_key:
-            logger.info("TinEye API key not configured; skipping provider call.")
-            return []
-
-        if not self.circuit_breaker.allow_request():
-            logger.warning("TinEye circuit breaker is OPEN; request degraded.")
-            return []
-
-        try:
-            files = {"image": ("query.jpg", image_bytes, "image/jpeg")}
-            async with httpx.AsyncClient(timeout=options.timeout_seconds) as client:
-                resp = await client.post(
-                    self.endpoint,
-                    files=files,
-                    headers={"X-API-Key": self.api_key},
-                )
-
-            if resp.status_code == 429:
-                self.circuit_breaker.record_failure()
-                logger.error("TinEye API rate limited (HTTP 429).")
-                return []
-
-            if resp.status_code != 200:
-                self.circuit_breaker.record_failure()
-                logger.error(f"TinEye API returned HTTP {resp.status_code}: {resp.text[:200]}")
-                return []
-
-            self.circuit_breaker.record_success()
-            data = resp.json()
-            results: list[NormalizedDiscoveryResult] = []
-
-            for match in data.get("results", {}).get("matches", []):
-                domain = match.get("domain", "tineye-match")
-                backlinks = match.get("backlinks", [])
-                p_url = backlinks[0].get("url") if backlinks else f"https://{domain}"
-                img_url = backlinks[0].get("image_url") if backlinks else p_url
-                score = float(match.get("score", 0.8))
-
-                results.append(
-                    NormalizedDiscoveryResult(
-                        provider=self.name,
-                        source_url=p_url,
-                        page_url=p_url,
-                        image_url=img_url,
-                        domain=domain,
-                        page_title=f"Match on {domain}",
-                        discovered_at=datetime.now(timezone.utc),
-                        provider_score=score,
-                        provider_raw_ref=match.get("query_hash"),
-                        c2pa_status=None,
-                        metadata={"tineye_score": score, "overlay": match.get("overlay")},
-                    )
-                )
-
-            return results
-        except Exception as err:
-            self.circuit_breaker.record_failure()
-            logger.error(f"TinEye API call failed: {err}")
-            return []
+_SENTINEL = object()
 
 
 class SearchAPIGoogleLensProvider(ImageDiscoveryProvider):
-    """
-    SearchAPI Google Lens Provider — Dispatches requests to SearchAPI HTTP API (engine=google_lens).
-    Receives real visual, exact, related, and knowledge graph matches and normalizes them into CYBERHUB candidate signals.
-    """
+    """SearchAPI Google Lens Provider (engine=google_lens)."""
 
-    def __init__(self, api_key: str | None = None, engine: str = "google_lens") -> None:
-        super().__init__("SearchAPIGoogleLens")
-        self.api_key = api_key or getattr(settings, "SEARCHAPI_API_KEY", None) or os.getenv("SEARCHAPI_API_KEY")
+    def __init__(self, api_key: Any = _SENTINEL, engine: str = "google_lens") -> None:
+        super().__init__("SearchAPI")
+        if api_key is _SENTINEL:
+            self.api_key = getattr(settings, "SEARCHAPI_API_KEY", None) or os.getenv("SEARCHAPI_API_KEY")
+        else:
+            self.api_key = api_key
         self.engine = engine or getattr(settings, "SEARCHAPI_ENGINE", "google_lens") or "google_lens"
         self.endpoint = "https://www.searchapi.io/api/v1/search"
 
@@ -524,7 +280,6 @@ class SearchAPIGoogleLensProvider(ImageDiscoveryProvider):
             logger.warning("SearchAPI circuit breaker is OPEN; request degraded.")
             return []
 
-        # Determine target image URL: use provided image_url or create ephemeral temp URL
         temp_token = None
         target_url = image_url
         if not target_url and image_bytes:
@@ -539,7 +294,7 @@ class SearchAPIGoogleLensProvider(ImageDiscoveryProvider):
             logger.error("SearchAPI Google Lens requires a valid image URL or image bytes.")
             return []
 
-        # Validate that the target image URL is externally reachable for SearchAPI crawlers
+        # Validate URL external reachability
         parsed_target = urllib.parse.urlparse(target_url)
         target_host = (parsed_target.hostname or "").lower()
         if (
@@ -547,58 +302,38 @@ class SearchAPIGoogleLensProvider(ImageDiscoveryProvider):
             or target_host.endswith(".local")
             or target_host.endswith(".internal")
         ):
-            logger.error(
-                f"Cannot dispatch SearchAPI request: target URL '{target_url}' is not externally reachable."
-            )
+            logger.error(f"Cannot dispatch SearchAPI request: target URL '{target_url}' is not externally reachable.")
             raise ValueError(
-                "REFERENCE_IMAGE_NOT_EXTERNALLY_REACHABLE: Search provider requires an externally reachable HTTPS image URL. "
-                "PUBLIC_BASE_URL is currently configured with a local/private address."
+                "REFERENCE_IMAGE_NOT_EXTERNALLY_REACHABLE: Search provider requires an externally reachable HTTPS image URL."
             )
-
-        logger.info(
-            f"SearchAPI Google Lens request dispatched: "
-            f"target_url={target_url}, engine={self.engine}, max_results={options.max_results}"
-        )
 
         try:
-            params: dict[str, Any] = {
+            params = {
                 "engine": self.engine,
                 "url": target_url,
                 "api_key": self.api_key,
             }
 
-            async with httpx.AsyncClient(timeout=options.timeout_seconds) as http_client:
-                response = await http_client.get(self.endpoint, params=params)
+            async with httpx.AsyncClient(timeout=options.timeout_seconds) as client:
+                _, data, _ = await _dispatch_with_retry(
+                    client=client,
+                    endpoint=self.endpoint,
+                    params=params,
+                    provider_name=self.name,
+                    timeout_seconds=options.timeout_seconds,
+                    max_retries=options.max_retries,
+                )
 
-                if response.status_code in (401, 403):
-                    self.circuit_breaker.record_failure()
-                    logger.error(f"SearchAPI Authentication Error ({response.status_code}): Invalid or missing API key.")
-                    raise PermissionError(f"PROVIDER_AUTH_ERROR: SearchAPI returned HTTP {response.status_code}")
+            self.circuit_breaker.record_success()
+            return self._parse_searchapi_response(data, options)
 
-                if response.status_code == 429:
-                    self.circuit_breaker.record_failure()
-                    logger.error("SearchAPI Rate/Quota Limit Exceeded (HTTP 429).")
-                    raise RuntimeError("PROVIDER_QUOTA_EXCEEDED: SearchAPI monthly quota or rate limit reached.")
-
-                if response.status_code != 200:
-                    self.circuit_breaker.record_failure()
-                    logger.error(f"SearchAPI HTTP Error {response.status_code}: {response.text[:200]}")
-                    return []
-
-                data = response.json()
-                self.circuit_breaker.record_success()
-                return self._parse_searchapi_response(data, options)
-
-        except httpx.TimeoutException as timeout_err:
-            self.circuit_breaker.record_failure()
-            logger.error(f"SearchAPI Timeout after {options.timeout_seconds}s: {timeout_err}")
-            raise TimeoutError(f"PROVIDER_TIMEOUT: SearchAPI request timed out: {timeout_err}") from timeout_err
         except (PermissionError, RuntimeError, TimeoutError, ValueError):
+            self.circuit_breaker.record_failure()
             raise
         except Exception as err:
             self.circuit_breaker.record_failure()
             logger.error(f"SearchAPI Google Lens discover failed: {err}")
-            return []
+            raise
         finally:
             if temp_token:
                 from app.services.temporary_image_service import temporary_image_service
@@ -609,13 +344,12 @@ class SearchAPIGoogleLensProvider(ImageDiscoveryProvider):
         data: dict[str, Any],
         options: ProviderOptions,
     ) -> list[NormalizedDiscoveryResult]:
-        """Normalize SearchAPI Google Lens JSON response into standardized NormalizedDiscoveryResult records."""
         if not isinstance(data, dict):
             return []
 
         results: list[NormalizedDiscoveryResult] = []
         search_metadata = data.get("search_metadata", {})
-        search_id = search_metadata.get("id", "")
+        search_id = search_metadata.get("id")
 
         # 1. Exact Matches
         exact_matches = data.get("exact_matches", [])
@@ -623,35 +357,32 @@ class SearchAPIGoogleLensProvider(ImageDiscoveryProvider):
             for item in exact_matches:
                 if not isinstance(item, dict):
                     continue
-                link = item.get("link") or item.get("url") or ""
-                img_url = item.get("image") or item.get("thumbnail") or link
+                link = item.get("link") or item.get("url")
+                if not link:
+                    continue
+                img_url = item.get("image") or item.get("thumbnail")
                 thumb_url = item.get("thumbnail") or img_url
-                title = item.get("title") or item.get("source") or "Exact Match"
-                domain = item.get("source") or (urllib.parse.urlparse(link).netloc if link else "unknown")
-                snippet = item.get("snippet") or ""
+                title = item.get("title") or item.get("source")
+                domain = item.get("source") or urllib.parse.urlparse(link).netloc
 
-                if link or img_url:
-                    results.append(
-                        NormalizedDiscoveryResult(
-                            provider=self.name,
-                            source_url=link or img_url,
-                            page_url=link or img_url,
-                            image_url=img_url or link,
-                            domain=domain,
-                            page_title=title,
-                            discovered_at=datetime.now(timezone.utc),
-                            provider_score=1.0,
-                            provider_raw_ref="exact_matches",
-                            c2pa_status=None,
-                            metadata={
-                                "match_type": "EXACT",
-                                "snippet": snippet,
-                                "thumbnail_url": thumb_url,
-                                "search_id": search_id,
-                                "position": item.get("position"),
-                            },
-                        )
+                results.append(
+                    NormalizedDiscoveryResult(
+                        provider=self.name,
+                        provider_result_id=str(item.get("position")) if item.get("position") is not None else None,
+                        title=title,
+                        source=domain,
+                        result_url=link,
+                        image_url=img_url,
+                        thumbnail_url=thumb_url,
+                        position=item.get("position"),
+                        result_type=ResultType.EXACT_MATCH.value,
+                        provider_metadata={
+                            "match_type": "EXACT_MATCH",
+                            "search_id": search_id,
+                            "snippet": item.get("snippet"),
+                        },
                     )
+                )
 
         # 2. Visual Matches
         visual_matches = data.get("visual_matches", [])
@@ -659,37 +390,34 @@ class SearchAPIGoogleLensProvider(ImageDiscoveryProvider):
             for item in visual_matches:
                 if not isinstance(item, dict):
                     continue
-                link = item.get("link") or item.get("url") or ""
-                img_url = item.get("image") or item.get("thumbnail") or link
+                link = item.get("link") or item.get("url")
+                if not link:
+                    continue
+                img_url = item.get("image") or item.get("thumbnail")
                 thumb_url = item.get("thumbnail") or img_url
-                title = item.get("title") or item.get("source") or "Visual Match"
-                domain = item.get("source") or (urllib.parse.urlparse(link).netloc if link else "unknown")
-                snippet = item.get("snippet") or ""
+                title = item.get("title") or item.get("source")
+                domain = item.get("source") or urllib.parse.urlparse(link).netloc
 
-                if link or img_url:
-                    results.append(
-                        NormalizedDiscoveryResult(
-                            provider=self.name,
-                            source_url=link or img_url,
-                            page_url=link or img_url,
-                            image_url=img_url or link,
-                            domain=domain,
-                            page_title=title,
-                            discovered_at=datetime.now(timezone.utc),
-                            provider_score=0.85,
-                            provider_raw_ref="visual_matches",
-                            c2pa_status=None,
-                            metadata={
-                                "match_type": "VISUALLY_SIMILAR",
-                                "snippet": snippet,
-                                "thumbnail_url": thumb_url,
-                                "search_id": search_id,
-                                "position": item.get("position"),
-                            },
-                        )
+                results.append(
+                    NormalizedDiscoveryResult(
+                        provider=self.name,
+                        provider_result_id=str(item.get("position")) if item.get("position") is not None else None,
+                        title=title,
+                        source=domain,
+                        result_url=link,
+                        image_url=img_url,
+                        thumbnail_url=thumb_url,
+                        position=item.get("position"),
+                        result_type=ResultType.VISUAL_MATCH.value,
+                        provider_metadata={
+                            "match_type": "VISUAL_MATCH",
+                            "search_id": search_id,
+                            "snippet": item.get("snippet"),
+                        },
                     )
+                )
 
-        # 3. Reverse Image Search (Pages with matching images / source pages)
+        # 3. Reverse Image Search (Pages with matching images)
         rev_search = data.get("reverse_image_search", {})
         if isinstance(rev_search, dict):
             pages = rev_search.get("pages_with_matching_images", [])
@@ -697,102 +425,84 @@ class SearchAPIGoogleLensProvider(ImageDiscoveryProvider):
                 for item in pages:
                     if not isinstance(item, dict):
                         continue
-                    link = item.get("link") or item.get("url") or ""
-                    title = item.get("title") or "Source Page"
-                    img_url = item.get("thumbnail") or item.get("image") or link
-                    domain = item.get("source") or (urllib.parse.urlparse(link).netloc if link else "unknown")
-                    snippet = item.get("snippet") or ""
+                    link = item.get("link") or item.get("url")
+                    if not link:
+                        continue
+                    img_url = item.get("thumbnail") or item.get("image")
+                    title = item.get("title")
+                    domain = item.get("source") or urllib.parse.urlparse(link).netloc
 
-                    if link or img_url:
-                        results.append(
-                            NormalizedDiscoveryResult(
-                                provider=self.name,
-                                source_url=link or img_url,
-                                page_url=link or img_url,
-                                image_url=img_url or link,
-                                domain=domain,
-                                page_title=title,
-                                discovered_at=datetime.now(timezone.utc),
-                                provider_score=0.90,
-                                provider_raw_ref="reverse_image_search_pages",
-                                c2pa_status=None,
-                                metadata={
-                                    "match_type": "SOURCE_PAGE",
-                                    "snippet": snippet,
-                                    "thumbnail_url": img_url,
-                                    "search_id": search_id,
-                                },
-                            )
+                    results.append(
+                        NormalizedDiscoveryResult(
+                            provider=self.name,
+                            provider_result_id=str(item.get("position")) if item.get("position") is not None else None,
+                            title=title,
+                            source=domain,
+                            result_url=link,
+                            image_url=img_url,
+                            thumbnail_url=img_url,
+                            position=item.get("position"),
+                            result_type=ResultType.VISUAL_MATCH.value,
+                            provider_metadata={
+                                "match_type": "PAGE_MATCH",
+                                "search_id": search_id,
+                                "snippet": item.get("snippet"),
+                            },
                         )
+                    )
 
-        # 4. Knowledge Graph & Related Searches
+        # 4. Knowledge Graph & Related
         knowledge_graph = data.get("knowledge_graph", [])
         if isinstance(knowledge_graph, list):
             for item in knowledge_graph:
                 if not isinstance(item, dict):
                     continue
-                link = item.get("link") or ""
-                title = item.get("title") or "Knowledge Graph Entity"
-                img_url = item.get("image") or item.get("thumbnail") or link
+                link = item.get("link")
+                if not link:
+                    continue
+                title = item.get("title")
+                img_url = item.get("image") or item.get("thumbnail")
                 domain = urllib.parse.urlparse(link).netloc if link else "google.com"
 
-                if link or img_url:
-                    results.append(
-                        NormalizedDiscoveryResult(
-                            provider=self.name,
-                            source_url=link or img_url,
-                            page_url=link or img_url,
-                            image_url=img_url or link,
-                            domain=domain,
-                            page_title=title,
-                            discovered_at=datetime.now(timezone.utc),
-                            provider_score=0.75,
-                            provider_raw_ref="knowledge_graph",
-                            c2pa_status=None,
-                            metadata={
-                                "match_type": "RELATED",
-                                "snippet": item.get("subtitle") or item.get("description", ""),
-                                "search_id": search_id,
-                            },
-                        )
+                results.append(
+                    NormalizedDiscoveryResult(
+                        provider=self.name,
+                        provider_result_id=None,
+                        title=title,
+                        source=domain,
+                        result_url=link,
+                        image_url=img_url,
+                        thumbnail_url=img_url,
+                        position=None,
+                        result_type=ResultType.RELATED.value,
+                        provider_metadata={
+                            "match_type": "KNOWLEDGE_GRAPH",
+                            "search_id": search_id,
+                            "subtitle": item.get("subtitle") or item.get("description"),
+                        },
                     )
+                )
 
         return results[: options.max_results]
 
 
-class DeterministicMockProvider(ImageDiscoveryProvider):
-    """Test-only hermetic mock provider. Prohibited in production execution."""
+class SerpApiGoogleLensProvider(ImageDiscoveryProvider):
+    """SerpApi Google Lens Provider (engine=google_lens)."""
 
-    def __init__(self, fixtures: list[dict[str, Any]] | None = None) -> None:
-        super().__init__("DeterministicMock")
-        self.fixtures = fixtures or [
-            {
-                "domain": "social.example.test",
-                "page_url": "https://social.example.test/post/88219",
-                "image_url": "https://social.example.test/media/88219_full.png",
-                "page_title": "Synthetic Test Post (social.example.test)",
-                "score": 0.94,
-                "threat_category": "SYNTHETIC_TEST_FIXTURE",
-            },
-            {
-                "domain": "news.example.test",
-                "page_url": "https://news.example.test/articles/409",
-                "image_url": "https://news.example.test/img/asset_409.jpg",
-                "page_title": "Synthetic Test Article (news.example.test)",
-                "score": 0.88,
-                "threat_category": "SYNTHETIC_TEST_FIXTURE",
-            },
-            {
-                "domain": "archive.example.test",
-                "page_url": "https://archive.example.test/media/item_12",
-                "image_url": "https://archive.example.test/media/item_12.png",
-                "page_title": "Synthetic Test Archive (archive.example.test)",
-                "score": 0.78,
-                "threat_category": "SYNTHETIC_TEST_FIXTURE",
-            },
-        ]
+    def __init__(self, api_key: Any = _SENTINEL, engine: str = "google_lens") -> None:
+        super().__init__("SerpApi")
+        if api_key is _SENTINEL:
+            self.api_key = getattr(settings, "SERPAPI_API_KEY", None) or os.getenv("SERPAPI_API_KEY")
+        else:
+            self.api_key = api_key
+        self.engine = engine or getattr(settings, "SERPAPI_ENGINE", "google_lens") or "google_lens"
+        self.endpoint = "https://serpapi.com/search.json"
 
     def get_status(self) -> ProviderStatus:
+        if not self.circuit_breaker.allow_request():
+            return ProviderStatus.DEGRADED
+        if not self.api_key or not str(self.api_key).strip():
+            return ProviderStatus.NOT_CONFIGURED
         return ProviderStatus.READY
 
     async def discover(
@@ -801,34 +511,311 @@ class DeterministicMockProvider(ImageDiscoveryProvider):
         image_url: str | None,
         options: ProviderOptions,
     ) -> list[NormalizedDiscoveryResult]:
-        # Production guard check
-        is_test_env = (
-            getattr(settings, "ALLOW_TEST_MOCK_PROVIDER", False)
-            or os.getenv("ALLOW_TEST_MOCK_PROVIDER") == "true"
-            or "pytest" in os.environ.get("_", "")
-            or "PYTEST_CURRENT_TEST" in os.environ
-        )
-        if not is_test_env:
-            raise PermissionError("DeterministicMockProvider is strictly prohibited in production discovery paths.")
+        status = self.get_status()
+        if status == ProviderStatus.NOT_CONFIGURED:
+            logger.info("SerpApi provider not configured (SERPAPI_API_KEY not found); skipping.")
+            return []
+
+        if status == ProviderStatus.DEGRADED or not self.circuit_breaker.allow_request():
+            logger.warning("SerpApi circuit breaker is OPEN; request degraded.")
+            return []
+
+        temp_token = None
+        target_url = image_url
+        if not target_url and image_bytes:
+            from app.services.temporary_image_service import temporary_image_service
+            temp_token, target_url = temporary_image_service.create_temporary_image(
+                image_bytes=image_bytes,
+                content_type="image/jpeg",
+                ttl_seconds=600,
+            )
+
+        if not target_url:
+            logger.error("SerpApi Google Lens requires a valid image URL or image bytes.")
+            return []
+
+        # Validate URL external reachability
+        parsed_target = urllib.parse.urlparse(target_url)
+        target_host = (parsed_target.hostname or "").lower()
+        if (
+            target_host in ("localhost", "127.0.0.1", "0.0.0.0", "::1")
+            or target_host.endswith(".local")
+            or target_host.endswith(".internal")
+        ):
+            logger.error(f"Cannot dispatch SerpApi request: target URL '{target_url}' is not externally reachable.")
+            raise ValueError(
+                "REFERENCE_IMAGE_NOT_EXTERNALLY_REACHABLE: Search provider requires an externally reachable HTTPS image URL."
+            )
+
+        try:
+            params = {
+                "engine": self.engine,
+                "url": target_url,
+                "api_key": self.api_key,
+            }
+
+            async with httpx.AsyncClient(timeout=options.timeout_seconds) as client:
+                _, data, _ = await _dispatch_with_retry(
+                    client=client,
+                    endpoint=self.endpoint,
+                    params=params,
+                    provider_name=self.name,
+                    timeout_seconds=options.timeout_seconds,
+                    max_retries=options.max_retries,
+                )
+
+            self.circuit_breaker.record_success()
+            return self._parse_serpapi_response(data, options)
+
+        except (PermissionError, RuntimeError, TimeoutError, ValueError):
+            self.circuit_breaker.record_failure()
+            raise
+        except Exception as err:
+            self.circuit_breaker.record_failure()
+            logger.error(f"SerpApi Google Lens discover failed: {err}")
+            raise
+        finally:
+            if temp_token:
+                from app.services.temporary_image_service import temporary_image_service
+                temporary_image_service.delete_temporary_image(temp_token)
+
+    def _parse_serpapi_response(
+        self,
+        data: dict[str, Any],
+        options: ProviderOptions,
+    ) -> list[NormalizedDiscoveryResult]:
+        if not isinstance(data, dict):
+            return []
 
         results: list[NormalizedDiscoveryResult] = []
-        for f in self.fixtures:
-            results.append(
-                NormalizedDiscoveryResult(
-                    provider=self.name,
-                    source_url=f["page_url"],
-                    page_url=f["page_url"],
-                    image_url=f["image_url"],
-                    domain=f["domain"],
-                    page_title=f["page_title"],
-                    discovered_at=datetime.now(timezone.utc),
-                    provider_score=f.get("score", 0.9),
-                    provider_raw_ref="mock_ref_001",
-                    c2pa_status="NOT_PRESENT",
-                    metadata={"threat_category": f.get("threat_category", "PUBLIC_WEB")},
+        search_metadata = data.get("search_metadata", {})
+        search_id = search_metadata.get("id")
+
+        # 1. Visual Matches
+        visual_matches = data.get("visual_matches", [])
+        if isinstance(visual_matches, list):
+            for item in visual_matches:
+                if not isinstance(item, dict):
+                    continue
+                link = item.get("link")
+                if not link:
+                    continue
+                title = item.get("title")
+                domain = item.get("source") or urllib.parse.urlparse(link).netloc
+                img_url = item.get("thumbnail") or item.get("original")
+                thumb_url = item.get("thumbnail") or img_url
+                pos = item.get("position")
+
+                results.append(
+                    NormalizedDiscoveryResult(
+                        provider=self.name,
+                        provider_result_id=str(pos) if pos is not None else None,
+                        title=title,
+                        source=domain,
+                        result_url=link,
+                        image_url=img_url,
+                        thumbnail_url=thumb_url,
+                        position=pos,
+                        result_type=ResultType.VISUAL_MATCH.value,
+                        provider_metadata={
+                            "match_type": "VISUAL_MATCH",
+                            "search_id": search_id,
+                            "source": domain,
+                        },
+                    )
                 )
-            )
-        return results
+
+        # 2. Knowledge Graph
+        kg = data.get("knowledge_graph", [])
+        if isinstance(kg, list):
+            for item in kg:
+                if not isinstance(item, dict):
+                    continue
+                link = item.get("link")
+                if not link:
+                    continue
+                title = item.get("title")
+                domain = urllib.parse.urlparse(link).netloc if link else "google.com"
+                img_url = item.get("thumbnail") or item.get("image")
+
+                results.append(
+                    NormalizedDiscoveryResult(
+                        provider=self.name,
+                        provider_result_id=None,
+                        title=title,
+                        source=domain,
+                        result_url=link,
+                        image_url=img_url,
+                        thumbnail_url=img_url,
+                        position=None,
+                        result_type=ResultType.RELATED.value,
+                        provider_metadata={
+                            "match_type": "KNOWLEDGE_GRAPH",
+                            "search_id": search_id,
+                            "subtitle": item.get("subtitle"),
+                        },
+                    )
+                )
+        elif isinstance(kg, dict):
+            link = kg.get("link")
+            if link:
+                results.append(
+                    NormalizedDiscoveryResult(
+                        provider=self.name,
+                        provider_result_id=None,
+                        title=kg.get("title"),
+                        source=urllib.parse.urlparse(link).netloc,
+                        result_url=link,
+                        image_url=kg.get("thumbnail") or kg.get("image"),
+                        thumbnail_url=kg.get("thumbnail"),
+                        position=None,
+                        result_type=ResultType.RELATED.value,
+                        provider_metadata={"match_type": "KNOWLEDGE_GRAPH", "search_id": search_id},
+                    )
+                )
+
+        # 3. Exact matches / reverse image search if present
+        exact = data.get("exact_matches", [])
+        if isinstance(exact, list):
+            for item in exact:
+                if not isinstance(item, dict):
+                    continue
+                link = item.get("link")
+                if not link:
+                    continue
+                results.append(
+                    NormalizedDiscoveryResult(
+                        provider=self.name,
+                        provider_result_id=str(item.get("position")) if item.get("position") is not None else None,
+                        title=item.get("title"),
+                        source=item.get("source") or urllib.parse.urlparse(link).netloc,
+                        result_url=link,
+                        image_url=item.get("thumbnail") or item.get("image"),
+                        thumbnail_url=item.get("thumbnail"),
+                        position=item.get("position"),
+                        result_type=ResultType.EXACT_MATCH.value,
+                        provider_metadata={"match_type": "EXACT_MATCH", "search_id": search_id},
+                    )
+                )
+
+        return results[: options.max_results]
+
+
+def _extract_url_str(val: Any) -> str | None:
+    """Safely extract a URL string from string, dictionary, or list structures."""
+    if val is None:
+        return None
+    if isinstance(val, str):
+        s = val.strip()
+        return s if s else None
+    if isinstance(val, dict):
+        for k in ("link", "url", "original", "thumbnail", "src", "image"):
+            v = val.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+            elif isinstance(v, dict):
+                extracted = _extract_url_str(v)
+                if extracted:
+                    return extracted
+    return None
+
+
+def canonicalize_url(raw_url: Any) -> str:
+    """Normalize a URL for cross-provider deduplication."""
+    clean_url = _extract_url_str(raw_url)
+    if not clean_url:
+        return ""
+    try:
+        parsed = urllib.parse.urlparse(clean_url)
+        scheme = (parsed.scheme or "http").lower()
+        netloc = (parsed.netloc or "").lower()
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        path = parsed.path.rstrip("/") if parsed.path else ""
+
+        # Remove standard tracking query parameters
+        tracking_params = {"utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "fbclid", "gclid", "ref"}
+        q_params = urllib.parse.parse_qsl(parsed.query, keep_blank_values=False)
+        clean_query = [(k, v) for k, v in q_params if k.lower() not in tracking_params]
+        query_str = urllib.parse.urlencode(sorted(clean_query)) if clean_query else ""
+
+        return urllib.parse.urlunparse((scheme, netloc, path, "", query_str, ""))
+    except Exception:
+        return clean_url.lower().rstrip("/")
+
+
+def deduplicate_discovery_results(results: list[NormalizedDiscoveryResult]) -> list[NormalizedDiscoveryResult]:
+    """
+    Deduplicate discovery results across providers:
+    - Normalizes URLs
+    - Merges matching page or image URLs
+    - Preserves provenance for all reporting providers on the merged record
+    """
+    if not results:
+        return []
+
+    deduped_map: dict[str, NormalizedDiscoveryResult] = {}
+    url_to_key: dict[str, str] = {}
+    img_to_key: dict[str, str] = {}
+
+    for res in results:
+        c_url = canonicalize_url(res.result_url)
+        c_img = canonicalize_url(res.image_url) if res.image_url else ""
+
+        # Find match key
+        match_key = None
+        if c_url and c_url in url_to_key:
+            match_key = url_to_key[c_url]
+        elif c_img and c_img in img_to_key:
+            match_key = img_to_key[c_img]
+
+        if match_key is None:
+            # New record
+            key = c_url or c_img or f"raw_{len(deduped_map)}"
+            res.provider_metadata["providers"] = [res.provider]
+            res.provider_metadata["provider_sources"] = {
+                res.provider: {
+                    "position": res.position,
+                    "provider_result_id": res.provider_result_id,
+                    "result_type": res.result_type,
+                    "raw_metadata": dict(res.provider_metadata),
+                }
+            }
+            deduped_map[key] = res
+            if c_url:
+                url_to_key[c_url] = key
+            if c_img:
+                img_to_key[c_img] = key
+        else:
+            # Merge with existing record
+            existing = deduped_map[match_key]
+            providers_list = existing.provider_metadata.get("providers", [existing.provider])
+            if res.provider not in providers_list:
+                providers_list.append(res.provider)
+            existing.provider_metadata["providers"] = providers_list
+
+            sources_dict = existing.provider_metadata.get("provider_sources", {})
+            sources_dict[res.provider] = {
+                "position": res.position,
+                "provider_result_id": res.provider_result_id,
+                "result_type": res.result_type,
+                "raw_metadata": dict(res.provider_metadata),
+            }
+            existing.provider_metadata["provider_sources"] = sources_dict
+
+            # Prefer higher ranking or more descriptive title
+            if not existing.title and res.title:
+                object.__setattr__(existing, "title", res.title)
+                object.__setattr__(existing, "page_title", res.title)
+            if not existing.image_url and res.image_url:
+                object.__setattr__(existing, "image_url", res.image_url)
+
+            if c_url:
+                url_to_key[c_url] = match_key
+            if c_img:
+                img_to_key[c_img] = match_key
+
+    return list(deduped_map.values())
 
 
 class ProviderOrchestrationService:
@@ -836,15 +823,12 @@ class ProviderOrchestrationService:
 
     def __init__(self) -> None:
         self.searchapi_provider = SearchAPIGoogleLensProvider()
-        self.google_provider = GoogleVisionWebDetectionProvider()
-        self.tineye_provider = TinEyeMatchEngineProvider()
-        self.mock_provider = DeterministicMockProvider()
+        self.serpapi_provider = SerpApiGoogleLensProvider()
 
     def get_provider_statuses(self) -> dict[str, dict[str, Any]]:
         """Return explicit status and configuration details for each provider."""
         searchapi_status = self.searchapi_provider.get_status()
-        google_status = self.google_provider.get_status()
-        tineye_status = self.tineye_provider.get_status()
+        serpapi_status = self.serpapi_provider.get_status()
         return {
             "searchapi_lens": {
                 "name": "SearchAPI (Google Lens)",
@@ -853,63 +837,79 @@ class ProviderOrchestrationService:
                 "circuit_breaker": self.searchapi_provider.circuit_breaker.state,
                 "engine": self.searchapi_provider.engine,
             },
-            "google_vision": {
-                "name": "Google Cloud Vision (Web Detection)",
-                "status": google_status.value,
-                "configured": google_status != ProviderStatus.NOT_CONFIGURED,
-                "circuit_breaker": self.google_provider.circuit_breaker.state,
-                "auth_method": "ADC" if self.google_provider._has_adc_credentials else ("API_KEY" if self.google_provider.api_key else "NONE"),
-            },
-            "tineye": {
-                "name": "TinEye MatchEngine",
-                "status": tineye_status.value,
-                "configured": bool(self.tineye_provider.api_key),
-                "circuit_breaker": self.tineye_provider.circuit_breaker.state,
+            "serpapi_lens": {
+                "name": "SerpApi (Google Lens)",
+                "status": serpapi_status.value,
+                "configured": serpapi_status != ProviderStatus.NOT_CONFIGURED,
+                "circuit_breaker": self.serpapi_provider.circuit_breaker.state,
+                "engine": self.serpapi_provider.engine,
             },
         }
 
-    async def execute_discovery(
+    async def execute_parallel_discovery(
         self,
         image_bytes: bytes,
         image_url: str | None = None,
         options: ProviderOptions | None = None,
-        use_mock_fallback: bool = False,
-    ) -> list[NormalizedDiscoveryResult]:
-        """Execute parallel discovery across active providers with error isolation."""
+    ) -> tuple[list[NormalizedDiscoveryResult], dict[str, dict[str, Any]]]:
+        """
+        Execute parallel discovery across SearchAPI and SerpApi with error isolation.
+        Returns: (deduplicated_results, per_provider_reports)
+        """
         opts = options or ProviderOptions()
-        all_results: list[NormalizedDiscoveryResult] = []
+        active_providers: list[tuple[str, ImageDiscoveryProvider]] = []
 
-        # Check if in test environment with mock fallback requested
-        is_test_env = (
-            getattr(settings, "ALLOW_TEST_MOCK_PROVIDER", False)
-            or os.getenv("ALLOW_TEST_MOCK_PROVIDER") == "true"
-            or "PYTEST_CURRENT_TEST" in os.environ
-        )
+        if self.searchapi_provider.get_status() == ProviderStatus.READY:
+            active_providers.append(("SearchAPI", self.searchapi_provider))
+        if self.serpapi_provider.get_status() == ProviderStatus.READY:
+            active_providers.append(("SerpApi", self.serpapi_provider))
 
-        active_providers: list[ImageDiscoveryProvider] = []
+        if not active_providers:
+            logger.warning("No active reverse image search providers are configured.")
+            return [], {}
 
-        if is_test_env and use_mock_fallback:
-            active_providers = [self.mock_provider]
-        else:
-            # Primary: SearchAPI Google Lens
-            if self.searchapi_provider.get_status() == ProviderStatus.READY:
-                active_providers.append(self.searchapi_provider)
-            # Secondary optional: Google Vision (if enabled/ready)
-            if getattr(settings, "GOOGLE_VISION_ENABLED", False) and self.google_provider.get_status() == ProviderStatus.READY:
-                active_providers.append(self.google_provider)
-            # Secondary optional: TinEye
-            if self.tineye_provider.get_status() == ProviderStatus.READY:
-                active_providers.append(self.tineye_provider)
-
-        for prov in active_providers:
+        # Dispatch parallel tasks
+        async def _call_provider(name: str, prov: ImageDiscoveryProvider) -> tuple[str, list[NormalizedDiscoveryResult] | Exception, float]:
+            t0 = time.perf_counter()
             try:
                 res = await prov.discover(image_bytes, image_url, opts)
-                all_results.extend(res)
-            except Exception as err:
-                logger.error(f"Provider '{prov.name}' failed during discovery: {err}")
+                lat = time.perf_counter() - t0
+                return name, res, lat
+            except Exception as e:
+                lat = time.perf_counter() - t0
+                return name, e, lat
 
-        return all_results
+        tasks = [_call_provider(name, prov) for name, prov in active_providers]
+        raw_outputs = await asyncio.gather(*tasks, return_exceptions=False)
+
+        all_raw_results: list[NormalizedDiscoveryResult] = []
+        provider_reports: dict[str, dict[str, Any]] = {}
+
+        for name, outcome, latency in raw_outputs:
+            if isinstance(outcome, Exception):
+                err_category = "AUTHENTICATION_FAILED" if isinstance(outcome, PermissionError) else (
+                    "RATE_LIMITED" if "QUOTA" in str(outcome) or "429" in str(outcome) else (
+                        "TIMEOUT" if isinstance(outcome, TimeoutError) else "PROVIDER_ERROR"
+                    )
+                )
+                provider_reports[name] = {
+                    "success": False,
+                    "error_category": err_category,
+                    "error_message": str(outcome)[:100],
+                    "latency_ms": round(latency * 1000, 2),
+                    "raw_count": 0,
+                }
+                logger.error(f"Provider '{name}' call failed ({err_category}) in {latency:.2f}s: {outcome}")
+            else:
+                all_raw_results.extend(outcome)
+                provider_reports[name] = {
+                    "success": True,
+                    "latency_ms": round(latency * 1000, 2),
+                    "raw_count": len(outcome),
+                }
+
+        deduped = deduplicate_discovery_results(all_raw_results)
+        return deduped, provider_reports
 
 
 provider_orchestrator = ProviderOrchestrationService()
-

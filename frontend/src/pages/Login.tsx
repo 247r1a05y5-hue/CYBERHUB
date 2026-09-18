@@ -2,14 +2,15 @@ import React, { useState } from "react";
 import { useNavigate, useLocation, Link } from "react-router-dom";
 import { Shield, ArrowRight, Lock, Mail, AlertCircle, Loader2 } from "lucide-react";
 import { useAuthStore } from "../stores/authStore";
+import { formatErrorMessage, safeRenderText } from "../utils/errorUtils";
 
 export const Login: React.FC = () => {
   const navigate = useNavigate();
   const location = useLocation();
   const { login, isLoading } = useAuthStore();
 
-  const [email, setEmail] = useState("analyst@cyberhub.security");
-  const [password, setPassword] = useState("Password123!");
+  const [email, setEmail] = useState("admin@cyberhub.dev");
+  const [password, setPassword] = useState("Admin1234!");
   const [error, setError] = useState<string | null>(null);
 
   const from = (location.state as any)?.from?.pathname || "/dashboard";
@@ -25,7 +26,7 @@ export const Login: React.FC = () => {
         setError("Invalid credentials or server unreachable.");
       }
     } catch (err: any) {
-      setError(err?.response?.data?.detail || "Authentication failed. Please check credentials.");
+      setError(formatErrorMessage(err, "Authentication failed. Please check credentials."));
     }
   };
 
@@ -58,7 +59,7 @@ export const Login: React.FC = () => {
           {error && (
             <div className="mb-5 p-3 rounded-lg bg-rose-500/10 border border-rose-500/20 flex items-center gap-2.5 text-rose-500 text-xs">
               <AlertCircle className="w-4 h-4 shrink-0" />
-              <span>{error}</span>
+              <span>{safeRenderText(error)}</span>
             </div>
           )}
 

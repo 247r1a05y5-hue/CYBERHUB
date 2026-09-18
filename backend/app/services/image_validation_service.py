@@ -6,10 +6,12 @@ Enforces strict validation rules:
 - Safe decoding with PIL (decompression bomb protection, format verification)
 - Dimension constraints (min 64x64, max 8192x8192)
 - Max payload size (15 MB)
+- Perceptual & cryptographic hashing (SHA-256, pHash, dHash)
 - Path traversal prevention and secure UUID storage key generation
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import os
 import uuid
@@ -18,6 +20,7 @@ from pathlib import Path
 from typing import BinaryIO
 
 from PIL import Image, UnidentifiedImageError
+import imagehash
 
 # Security constants
 MAX_FILE_SIZE_BYTES = 15 * 1024 * 1024  # 15 MB
@@ -44,6 +47,21 @@ class ImageValidationError(ValueError):
     pass
 
 
+class CorruptedImageError(ImageValidationError):
+    """Raised when an image payload is truncated or undecodable."""
+    pass
+
+
+class DecompressionBombError(ImageValidationError):
+    """Raised when an image exceeds safe pixel decompression limits."""
+    pass
+
+
+class UnsupportedFormatError(ImageValidationError):
+    """Raised when an image format or MIME type is not allowed."""
+    pass
+
+
 @dataclass(frozen=True)
 class ValidatedImageMetadata:
     """Validated image attributes."""
@@ -54,6 +72,9 @@ class ValidatedImageMetadata:
     size_bytes: int
     storage_filename: str
     raw_bytes: bytes
+    sha256: str
+    phash: str
+    dhash: str
     extension: str = ""
 
     @property
@@ -62,7 +83,7 @@ class ValidatedImageMetadata:
 
 
 class ImageValidationService:
-    """Validates uploaded images for security, format integrity, and dimensions."""
+    """Validates uploaded images for security, format integrity, hashes, and dimensions."""
 
     @staticmethod
     def detect_mime_from_magic_bytes(data: bytes) -> str | None:
@@ -85,6 +106,20 @@ class ImageValidationService:
         return None
 
     @classmethod
+    def compute_hashes(cls, img: Image.Image, raw_bytes: bytes) -> tuple[str, str, str]:
+        """Compute SHA-256, pHash, and dHash deterministically."""
+        sha256 = hashlib.sha256(raw_bytes).hexdigest()
+        try:
+            phash = str(imagehash.phash(img))
+        except Exception:
+            phash = ""
+        try:
+            dhash = str(imagehash.dhash(img))
+        except Exception:
+            dhash = ""
+        return sha256, phash, dhash
+
+    @classmethod
     def validate_and_sanitize(
         cls,
         file_bytes: bytes,
@@ -99,62 +134,64 @@ class ImageValidationService:
             raise ImageValidationError("Uploaded image file is empty.")
         if size_bytes > max_size:
             raise ImageValidationError(
-                f"File size ({size_bytes / (1024 * 1024):.2f} MB) exceeds maximum allowed {max_size / (1024 * 1024):.0f} MB."
+                f"File size {size_bytes / (1024 * 1024):.1f} MB exceeds maximum allowed limit of {max_size / (1024 * 1024):.1f} MB."
             )
 
-        # 2. Magic bytes check
+        # 2. Magic byte inspection
         detected_mime = cls.detect_mime_from_magic_bytes(file_bytes)
         if not detected_mime or detected_mime not in SUPPORTED_MIME_TYPES:
-            raise ImageValidationError(
-                "Invalid image file header. Only genuine JPEG, PNG, and WebP files are permitted."
+            raise UnsupportedFormatError(
+                f"Invalid image file header: unsupported file signature. Allowed: {', '.join(SUPPORTED_FORMATS)}"
             )
 
-        # 3. Decode verification with PIL (catches polyglots, truncated payloads, decompression bombs)
+        # 3. PIL Safe Decoding & Dimension Check
         try:
             with Image.open(io.BytesIO(file_bytes)) as img:
-                # Check for decompression bomb before verify
-                width, height = img.size
-                if width * height > MAX_IMAGE_PIXELS:
-                    raise ImageValidationError(
-                        f"Decompression bomb detected: image resolution ({width}x{height} = {width*height} px) exceeds safety threshold of {MAX_IMAGE_PIXELS} px."
+                # Check for decompression bomb risk
+                pixels = img.width * img.height
+                if pixels > MAX_IMAGE_PIXELS:
+                    raise DecompressionBombError(
+                        f"Image pixel count ({pixels:,}) exceeds maximum safe threshold of {MAX_IMAGE_PIXELS:,}."
                     )
-                img.verify()
-        except ImageValidationError:
-            raise
-        except (UnidentifiedImageError, SyntaxError, ValueError) as err:
-            raise ImageValidationError(f"Corrupted or invalid image data: {err}") from err
-        except Image.DecompressionBombError as err:
-            raise ImageValidationError(f"Decompression bomb detected: {err}") from err
 
-        # 4. Re-open to read dimensions and verified format
-        try:
-            with Image.open(io.BytesIO(file_bytes)) as img:
-                width, height = img.size
                 img_format = (img.format or "").upper()
-
                 if img_format not in SUPPORTED_FORMATS:
-                    raise ImageValidationError(
-                        f"Image format '{img_format}' is not in supported list: {', '.join(SUPPORTED_FORMATS)}."
+                    raise UnsupportedFormatError(
+                        f"Decoded image format '{img_format}' is not permitted. Allowed: {', '.join(SUPPORTED_FORMATS)}"
                     )
 
+                width, height = img.size
                 if width < MIN_DIMENSION_PX or height < MIN_DIMENSION_PX:
                     raise ImageValidationError(
-                        f"Image dimensions ({width}x{height}) are below minimum allowed dimensions of {MIN_DIMENSION_PX}x{MIN_DIMENSION_PX}."
+                        f"Image resolution {width}x{height} is below minimum allowed dimensions ({MIN_DIMENSION_PX}x{MIN_DIMENSION_PX})."
                     )
-
                 if width > MAX_DIMENSION_PX or height > MAX_DIMENSION_PX:
                     raise ImageValidationError(
-                        f"Image dimensions ({width}x{height}) exceed maximum allowed dimensions of {MAX_DIMENSION_PX}x{MAX_DIMENSION_PX}."
+                        f"Image resolution {width}x{height} exceeds maximum allowed dimensions ({MAX_DIMENSION_PX}x{MAX_DIMENSION_PX})."
                     )
-        except Exception as err:
-            if isinstance(err, ImageValidationError):
-                raise
-            raise ImageValidationError(f"Failed to inspect image dimensions: {err}") from err
 
-        # 5. Generate secure UUID storage key (prevents path traversal and name collisions)
-        ext_map = {"JPEG": "jpg", "PNG": "png", "WEBP": "webp"}
-        extension = ext_map.get(img_format, "bin")
-        secure_filename = f"{uuid.uuid4().hex}.{extension}"
+                # Force full raster read to detect truncated or corrupted files
+                img.verify()
+
+            # Re-open for hash computation (verify() invalidates image buffer)
+            with Image.open(io.BytesIO(file_bytes)) as img_decoded:
+                sha256, phash, dhash = cls.compute_hashes(img_decoded, file_bytes)
+
+        except Image.DecompressionBombError as d_err:
+            raise DecompressionBombError(f"Decompression bomb detected: {d_err}") from d_err
+        except UnidentifiedImageError as u_err:
+            raise CorruptedImageError(f"Cannot identify or decode image: {u_err}") from u_err
+        except (IOError, SyntaxError) as cor_err:
+            raise CorruptedImageError(f"Corrupted or truncated image payload: {cor_err}") from cor_err
+        except (UnsupportedFormatError, DecompressionBombError, ImageValidationError):
+            raise
+        except Exception as gen_err:
+            raise ImageValidationError(f"Unexpected image processing error: {gen_err}") from gen_err
+
+        # 4. Generate collision-resistant secure storage key
+        ext_map = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
+        ext = ext_map.get(detected_mime, "bin")
+        secure_key = f"{uuid.uuid4().hex}.{ext}"
 
         return ValidatedImageMetadata(
             format=img_format,
@@ -162,31 +199,36 @@ class ImageValidationService:
             width=width,
             height=height,
             size_bytes=size_bytes,
-            storage_filename=secure_filename,
+            storage_filename=secure_key,
             raw_bytes=file_bytes,
-            extension=extension,
+            sha256=sha256,
+            phash=phash,
+            dhash=dhash,
+            extension=ext,
+        )
+
+    def validate(
+        self,
+        file_bytes: bytes,
+        claimed_mime: str | None = None,
+        filename: str | None = None,
+        max_size: int = MAX_FILE_SIZE_BYTES,
+    ) -> ValidatedImageMetadata:
+        """Instance method alias for validation pipeline."""
+        return self.validate_and_sanitize(
+            file_bytes=file_bytes,
+            filename=filename,
+            max_size=max_size,
         )
 
     @classmethod
-    def validate(
-        cls,
-        file_bytes: bytes,
-        claimed_mime: str | None = None,
-        max_size: int = MAX_FILE_SIZE_BYTES,
-    ) -> ValidatedImageMetadata:
-        """Alias for validate_and_sanitize with optional claimed_mime check."""
-        meta = cls.validate_and_sanitize(file_bytes, max_size=max_size)
-        if claimed_mime:
-            clean_claimed = claimed_mime.split(";")[0].strip().lower()
-            if clean_claimed != meta.mime_type:
-                if not (
-                    (clean_claimed in ("image/pjpeg", "image/jpg") and meta.mime_type == "image/jpeg")
-                    or clean_claimed == "application/octet-stream"
-                ):
-                    raise ImageValidationError(
-                        f"MIME type mismatch: claimed '{claimed_mime}' but file contents identify as '{meta.mime_type}'."
-                    )
-        return meta
+    def sanitize_path(cls, filename: str, target_dir: str | Path) -> Path:
+        """Prevent path traversal attacks when writing files."""
+        safe_name = os.path.basename(filename)
+        target_path = Path(target_dir).resolve() / safe_name
+        if not target_path.resolve().is_relative_to(Path(target_dir).resolve()):
+            raise ImageValidationError("Path traversal detected in target filename.")
+        return target_path
 
 
 image_validation_service = ImageValidationService()

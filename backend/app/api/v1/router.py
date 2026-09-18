@@ -10,6 +10,7 @@ from app.api.v1.endpoints.auth import router as auth_router
 from app.api.v1.endpoints.cases import router as cases_router
 from app.api.v1.endpoints.dashboard import router as dashboard_router
 from app.api.v1.endpoints.datasets import router as datasets_router
+from app.api.v1.endpoints.participants import router as participants_router
 from app.api.v1.endpoints.diagnostics import router as diagnostics_router
 from app.api.v1.endpoints.evidence import router as evidence_router
 from app.api.v1.endpoints.health import router as health_router
@@ -42,6 +43,9 @@ api_router.include_router(users_router, prefix="/users", tags=["users"])
 # CyberHub Case Lifecycle & Bounded Datasets
 api_router.include_router(cases_router, prefix="/cases", tags=["cases"])
 api_router.include_router(datasets_router, prefix="/datasets", tags=["datasets"])
+
+# Controlled Dataset — AWS Rekognition Pipeline
+api_router.include_router(participants_router, prefix="/dataset", tags=["dataset-participants"])
 
 # Image Exposure Investigation (Strict Image-to-Image Pipeline)
 api_router.include_router(image_investigations_router, prefix="/investigations", tags=["investigations"])

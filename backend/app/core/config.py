@@ -1,15 +1,17 @@
 """Application configuration — loaded from environment variables."""
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from typing import Literal
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(".env", "backend/.env", "../.env"),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
@@ -128,22 +130,64 @@ class Settings(BaseSettings):
     SEARCHAPI_ENABLED: bool = True
     SEARCHAPI_API_KEY: str | None = None
     SEARCHAPI_ENGINE: str = "google_lens"
+    SERPAPI_ENABLED: bool = True
+    SERPAPI_API_KEY: str | None = None
+    SERPAPI_ENGINE: str = "google_lens"
+    FIRECRAWL_API_KEY: str | None = None
+    FIRECRAWL_API_URL: str = "https://api.firecrawl.dev/v1/scrape"
+    BROWSERLESS_TOKEN: str | None = None
+    BROWSERLESS_API_URL: str = "https://chrome.browserless.io/content"
     GOOGLE_VISION_ENABLED: bool = False
     GOOGLE_VISION_API_KEY: str | None = None
     TINEYE_API_KEY: str | None = None
     PUBLIC_BASE_URL: str = "http://localhost:8000"
     ALLOW_TEST_MOCK_PROVIDER: bool = False
 
+    # ── Phase 3 Investigation Resource Limits & Crawl Courtesy ─────────────
+    MAX_PAGE_BYTES: int = 5 * 1024 * 1024  # 5 MB
+    MAX_IMAGE_BYTES: int = 10 * 1024 * 1024  # 10 MB
+    MAX_IMAGES_PER_PAGE: int = 15
+    MAX_REDIRECTS: int = 5
+    MAX_PAGE_TIME_SECONDS: float = 10.0
+    MAX_CANDIDATE_IMAGES_PER_RESULT: int = 10
+    MAX_OCR_IMAGES: int = 5
+    MAX_HISTORY_LOOKUPS: int = 5
+    MAX_CONTEXT_QUERIES: int = 2
+    DOMAIN_RATE_LIMIT_RPS: float = 2.0
+
+    @model_validator(mode="after")
+    def validate_provider_keys(self) -> "Settings":
+        # Reject deprecated SERPAPI_KEY env var if passed
+        if os.getenv("SERPAPI_KEY") is not None and os.getenv("SERPAPI_API_KEY") is None:
+            raise ValueError("Deprecated environment variable 'SERPAPI_KEY' detected. Use 'SERPAPI_API_KEY' instead.")
+        return self
+
+    def __repr__(self) -> str:
+        return (
+            f"<Settings app_env={self.app_env} debug={self.app_debug} "
+            f"searchapi_configured={bool(self.SEARCHAPI_API_KEY)} "
+            f"serpapi_configured={bool(self.SERPAPI_API_KEY)}>"
+        )
+
+    # ── AWS Rekognition ─────────────────────────────────────────────────────
+    # Credentials are read from standard AWS credential chain (env vars,
+    # ~/.aws/credentials, or IAM role). Never hardcoded, never logged.
+    AWS_REGION: str | None = None
+    AWS_REKOGNITION_COLLECTION_ID: str | None = None
+    # Optional explicit credential overrides (prefer IAM role / env chain)
+    AWS_ACCESS_KEY_ID: str | None = None
+    AWS_SECRET_ACCESS_KEY: str | None = None
+
     # ── Rate Limiting ───────────────────────────────────────────────────────
     login_rate_limit: str = "10/minute"
 
     # ── Seed / Demo (STRICTLY DEVELOPMENT & TEST ONLY) ──────────────────────
     allow_demo_seeding: bool = True
-    seed_admin_email: str = "admin@cyber.local"
+    seed_admin_email: str = "admin@cyberhub.dev"
     seed_admin_password: str = "Admin1234!"
-    seed_analyst_email: str = "analyst@cyberhub.security"
+    seed_analyst_email: str = "analyst@cyberhub.dev"
     seed_analyst_password: str = "Password123!"
-    seed_viewer_email: str = "viewer@cyber.local"
+    seed_viewer_email: str = "viewer@cyberhub.dev"
     seed_viewer_password: str = "Viewer1234!"
 
 

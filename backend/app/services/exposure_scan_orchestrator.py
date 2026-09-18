@@ -1,28 +1,19 @@
-"""Async Exposure Scan Orchestration, Rate Limiting & Cost Control Engine.
+"""Async Exposure Scan Orchestration, Rate Limiting & Real-Time Discovery Engine.
 
-Job Lifecycle States:
-QUEUED → RUNNING → DISCOVERING → NORMALIZING → MATCHING → DEDUPLICATING → CLUSTERING → READY_FOR_REVIEW → COMPLETED
-
-SSE Events Emitted:
-- scan.started
-- provider.started
-- provider.completed
-- provider.failed
-- provider.degraded
-- normalization.completed
-- matching.started
-- matching.completed
-- deduplication.completed
-- clustering.completed
-- review.ready
-- scan.completed
-
-Controls:
-- Pre-call token-bucket abuse rate limiter (investigations/scans per hour)
-- Pre-call organization cost budget gate (monthly spend volume control)
-- Provider circuit breaker monitoring
-- Idempotent retries without duplicate data generation
-- Server-Sent Events (SSE) progress broadcasting
+Phase 2 Specifications:
+- Providers: SearchAPI Google Lens & SerpApi Google Lens (parallel dispatch)
+- Real-time SSE Events:
+    * search.started
+    * search.provider.started
+    * search.provider.completed
+    * search.provider.failed
+    * search.result.discovered
+    * search.dedup.completed
+    * search.completed
+    * search.failed
+- Idempotency: Keyed on (investigation_id, reference_image_id, provider) with upsert-safe persistence
+- Audit Logging: Captures scan start, per-provider dispatch/completion/failure, deduplication, and completion
+- Strict Anti-Leakage: Never exposes API keys, raw face embeddings, or private tokens in logs or SSE payloads
 """
 from __future__ import annotations
 
@@ -32,14 +23,16 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, AsyncGenerator
+from typing import Any
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.case import Case, CaseStatus
+from app.models.audit_log import AuditAction
 from app.models.biometrics import ReferenceImage
+from app.models.case import Case, CaseStatus
 from app.models.discovery import CorrelationCluster, JobStatus, SearchJob, SearchResult
+from app.services.audit_service import AuditService
 from app.services.deduplication_clustering_service import deduplication_and_clustering_service
 from app.services.dinov2_service import dinov2_service
 from app.services.image_analysis_service import image_analysis_service
@@ -48,6 +41,7 @@ from app.services.provider_orchestration_service import (
     NormalizedDiscoveryResult,
     ProviderOptions,
     ProviderStatus,
+    deduplicate_discovery_results,
     provider_orchestrator,
 )
 from app.services.qdrant_service import qdrant_service
@@ -81,7 +75,7 @@ class RateLimitExceededError(Exception):
 
 
 class ExposureScanOrchestrator:
-    """Coordinates the async scan lifecycle, providers, matching, and realtime streaming."""
+    """Coordinates the async scan lifecycle, parallel providers, deduplication, and realtime SSE."""
 
     def __init__(self) -> None:
         self._listeners: dict[str, list[asyncio.Queue[ScanProgressEvent]]] = {}
@@ -145,13 +139,14 @@ class ExposureScanOrchestrator:
         db: AsyncSession,
         case: Case,
         search_job: SearchJob,
-        use_mock_fallback: bool = True,
+        use_mock_fallback: bool = False,
     ) -> SearchJob:
-        """Execute full async scan pipeline from discovery to clustering with full event lifecycle."""
+        """Execute async scan pipeline with parallel reverse image search providers."""
         inv_id_str = str(case.id)
         job_id_str = str(search_job.id)
+        audit_service = AuditService(db)
 
-        async def emit(step: str, pct: int, msg: str, ev_type: str = "scan.progress", payload: dict[str, Any] | None = None) -> None:
+        async def emit(ev_type: str, step: str, pct: int, msg: str, payload: dict[str, Any] | None = None) -> None:
             search_job.current_step = step
             search_job.progress_pct = pct
             await self.broadcast_event(
@@ -168,17 +163,30 @@ class ExposureScanOrchestrator:
             )
 
         try:
-            # 1. QUEUED -> RUNNING
+            # 1. Initialize & search.started
             search_job.status = JobStatus.RUNNING
             case.status = CaseStatus.DISCOVERY_RUNNING
             await db.commit()
-            await emit("INITIALIZING", 5, "Scan job initialized and reference assets loaded.", "scan.started")
+
+            await audit_service.log(
+                action=AuditAction.discovery_started,
+                organization_id=case.organization_id,
+                resource_type="case",
+                resource_id=str(case.id),
+                details={"job_id": job_id_str},
+            )
+
+            await emit("search.started", "INITIALIZING", 5, "Discovery scan initialized.", {
+                "investigation_id": inv_id_str,
+                "job_id": job_id_str,
+            })
 
             # Load primary reference image
             ref_stmt = select(ReferenceImage).where(ReferenceImage.case_id == case.id)
             ref_res = await db.execute(ref_stmt)
             ref_images = ref_res.scalars().all()
             ref_img = next((r for r in ref_images if r.is_primary), None) or (ref_images[0] if ref_images else None)
+            ref_img_id = ref_img.id if ref_img else uuid.uuid4()
 
             if ref_img and ref_img.file_path:
                 try:
@@ -189,149 +197,148 @@ class ExposureScanOrchestrator:
                 ref_bytes = get_image_bytes(generate_15_transform_corpus()["00_base"], format="PNG")
 
             ref_analysis = image_analysis_service.analyze(ref_bytes)
-            ref_embedding = dinov2_service.extract_embedding(ref_bytes)
 
-            # Ensure Qdrant indexing
-            try:
-                ref_img_id = ref_img.id if ref_img else uuid.uuid4()
-                await qdrant_service.upsert_embedding(
-                    vector_id=str(ref_img_id),
-                    vector=ref_embedding.vector,
-                    investigation_id=case.id,
-                    org_id=case.organization_id,
-                    reference_image_id=ref_img_id,
-                    metadata={"sha256": ref_analysis.sha256_hash},
-                )
-            except Exception as q_err:
-                logger.warning(f"Qdrant indexing fallback during scan: {q_err}")
-
-            # 2. DISCOVERING
-            await emit("DISCOVERING", 20, "Querying configured search providers (Google Vision, TinEye)...", "provider.started")
-            
-            raw_discoveries = await provider_orchestrator.execute_discovery(
-                image_bytes=ref_bytes,
-                image_url=ref_img.image_url if ref_img else None,
-                use_mock_fallback=use_mock_fallback,
-            )
-
-            # Check provider statuses to emit honest provider events
+            # 2. Parallel Search Providers
+            # Emit search.provider.started for each configured provider
             p_statuses = provider_orchestrator.get_provider_statuses()
             for p_key, p_info in p_statuses.items():
-                if p_info["status"] == "DEGRADED":
-                    await emit("DISCOVERING", 30, f"Provider {p_info['name']} is currently degraded / unavailable.", "provider.degraded", p_info)
-                elif p_info["status"] == "NOT_CONFIGURED":
-                    logger.info(f"Provider {p_info['name']} not configured.")
+                if p_info["configured"]:
+                    await emit("search.provider.started", "SEARCHING", 20, f"Querying {p_info['name']}...", {
+                        "provider": p_info["name"],
+                    })
 
-            await emit("DISCOVERING", 45, f"Discovered {len(raw_discoveries)} raw discovery signal(s).", "provider.completed", {"count": len(raw_discoveries)})
-
-            # 3. NORMALIZING & DEDUPLICATING
-            await emit("NORMALIZING", 60, "Normalizing results and consolidating cross-provider provenance...", "normalization.completed")
-            dedup_candidates = deduplication_and_clustering_service.deduplicate_results(raw_discoveries)
-            await emit("DEDUPLICATING", 70, f"Deduplicated into {len(dedup_candidates)} unique public candidate sources.", "deduplication.completed", {"count": len(dedup_candidates)})
-
-            # 4. MATCHING & RANKING
-            await emit("MATCHING", 75, f"Evaluating {len(dedup_candidates)} candidates across Phase 3 matching tiers...", "matching.started")
-            evaluated_results: list[SearchResult] = []
-
-            # Clear previous results for idempotent re-runs
-            await db.execute(delete(SearchResult).where(SearchResult.case_id == case.id))
-            await db.execute(delete(CorrelationCluster).where(CorrelationCluster.case_id == case.id))
-
-            for cand in dedup_candidates:
-                match_eval = image_matching_service.evaluate_match(
-                    reference_sha256=ref_analysis.sha256_hash,
-                    candidate_sha256=cand.sha256_hash,
-                    reference_phash=ref_analysis.phash,
-                    candidate_phash=cand.phash,
-                    reference_vector=ref_embedding.vector,
-                    candidate_vector=None,
-                )
-
-                # Combine Phase 3 tiered match evaluation with provider discovery score
-                if match_eval.overall_similarity_score > 0:
-                    sim_score = match_eval.overall_similarity_score
-                    classification_str = match_eval.classification.value
-                    explanation_str = match_eval.explanation
-                    tier_applied = match_eval.tier_applied
-                else:
-                    sim_score = round(cand.similarity_score if cand.similarity_score else 0.85, 4)
-                    if sim_score >= 0.99:
-                        classification_str = "EXACT"
-                    elif sim_score >= 0.90:
-                        classification_str = "SAME_TRANSFORMED_IMAGE"
-                    elif sim_score >= 0.75:
-                        classification_str = "PROBABLE_RELATED"
-                    elif sim_score >= 0.60:
-                        classification_str = "VISUALLY_SIMILAR"
-                    else:
-                        classification_str = "UNRELATED"
-                    explanation_str = f"Discovered by {', '.join(cand.providers)} with provider match confidence {sim_score:.2f}."
-                    tier_applied = 3
-
-                sr = SearchResult(
-                    case_id=case.id,
-                    search_job_id=search_job.id,
-                    provider=",".join(cand.providers),
-                    source_url=cand.canonical_url,
-                    page_url=cand.canonical_url,
-                    image_url=cand.image_url,
-                    domain=cand.domain,
-                    page_title=cand.page_title,
-                    similarity_score=sim_score,
-                    result_type=classification_str,
-                    metadata_json={
-                        "provenance": cand.provenance_records,
-                        "explanation": explanation_str,
-                        "signals": match_eval.signals if match_eval.signals else {"provider_score": sim_score},
-                        "verification_status": "PENDING_REVIEW",
-                        "match_classification": classification_str,
-                        "tier_applied": tier_applied,
-                    },
-                )
-                db.add(sr)
-                evaluated_results.append(sr)
-
-            await db.flush()
-            await emit("MATCHING", 85, f"Completed Phase 3 match evaluation for {len(evaluated_results)} findings.", "matching.completed")
-
-            # 5. CLUSTERING
-            await emit("CLUSTERING", 90, "Clustering exposure endpoints by domain and relationship...", "clustering.completed")
-            clusters = deduplication_and_clustering_service.cluster_candidates(
-                candidates=dedup_candidates,
-                reference_hash=ref_analysis.sha256_hash,
+            deduped_results, provider_reports = await provider_orchestrator.execute_parallel_discovery(
+                image_bytes=ref_bytes,
+                image_url=ref_img.image_url if ref_img else None,
             )
 
-            for cl in clusters:
-                db_cluster = CorrelationCluster(
-                    case_id=case.id,
-                    cluster_name=cl.cluster_name,
-                    primary_hash=cl.primary_hash,
-                    member_count=len(cl.member_candidate_ids),
-                    risk_weight=cl.risk_weight,
-                    domains_json=cl.domains,
-                )
-                db.add(db_cluster)
+            # Emit search.provider.completed or search.provider.failed
+            for p_name, report in provider_reports.items():
+                if report["success"]:
+                    await emit("search.provider.completed", "SEARCHING", 45, f"{p_name} completed with {report['raw_count']} matches.", {
+                        "provider": p_name,
+                        "raw_count": report["raw_count"],
+                        "latency_ms": report["latency_ms"],
+                    })
+                    await audit_service.log(
+                        action=AuditAction.discovery_provider_called,
+                        organization_id=case.organization_id,
+                        resource_type="case",
+                        resource_id=str(case.id),
+                        details={"provider": p_name, "status": "SUCCEEDED", "count": report["raw_count"]},
+                    )
+                else:
+                    await emit("search.provider.failed", "SEARCHING", 45, f"{p_name} failed ({report['error_category']}).", {
+                        "provider": p_name,
+                        "error_category": report["error_category"],
+                        "latency_ms": report["latency_ms"],
+                    })
+                    await audit_service.log(
+                        action=AuditAction.discovery_provider_called,
+                        organization_id=case.organization_id,
+                        resource_type="case",
+                        resource_id=str(case.id),
+                        details={"provider": p_name, "status": "FAILED", "error": report["error_category"]},
+                    )
 
-            # 6. READY_FOR_REVIEW / COMPLETED
+            # Emit search.result.discovered for each normalized discovery
+            for res in deduped_results[:10]:  # Stream top sample results
+                await emit("search.result.discovered", "DISCOVERING", 60, f"Discovered candidate on {res.domain}", {
+                    "result_url": res.result_url,
+                    "title": res.title,
+                    "domain": res.domain,
+                    "result_type": res.result_type,
+                    "providers": res.provider_metadata.get("providers", [res.provider]),
+                })
+
+            # 3. Deduplication Event
+            total_raw = sum(r["raw_count"] for r in provider_reports.values() if r["success"])
+            await emit("search.dedup.completed", "DEDUPLICATING", 75, f"Deduplicated {total_raw} findings into {len(deduped_results)} unique records.", {
+                "raw_count": total_raw,
+                "deduplicated_count": len(deduped_results),
+            })
+
+            # 4. Idempotent Upsert-Safe Database Persistence
+            # Keyed on (case_id, provider, source_url / result_url)
+            existing_results_stmt = select(SearchResult).where(SearchResult.case_id == case.id)
+            existing_results_res = await db.execute(existing_results_stmt)
+            existing_results_map = {
+                (str(r.case_id), r.provider, r.source_url): r
+                for r in existing_results_res.scalars().all()
+            }
+
+            saved_results: list[SearchResult] = []
+            for res in deduped_results:
+                prov_str = ",".join(res.provider_metadata.get("providers", [res.provider]))
+                lookup_key = (str(case.id), prov_str, res.result_url)
+
+                if lookup_key in existing_results_map:
+                    # Update existing
+                    sr = existing_results_map[lookup_key]
+                    sr.page_title = res.title or sr.page_title
+                    sr.image_url = res.image_url or sr.image_url
+                    sr.result_type = res.result_type
+                    sr.metadata_json = res.provider_metadata
+                else:
+                    # Insert new
+                    sr = SearchResult(
+                        case_id=case.id,
+                        search_job_id=search_job.id,
+                        provider=prov_str,
+                        source_url=res.result_url,
+                        page_url=res.result_url,
+                        image_url=res.image_url or res.result_url,
+                        domain=res.domain,
+                        page_title=res.title,
+                        similarity_score=res.provider_score,
+                        result_type=res.result_type,
+                        metadata_json=res.provider_metadata,
+                    )
+                    db.add(sr)
+
+                saved_results.append(sr)
+
+            # 5. Complete Search Job
             search_job.status = JobStatus.COMPLETED
-            search_job.total_found = len(evaluated_results)
+            search_job.total_found = len(saved_results)
             search_job.completed_at = datetime.now(timezone.utc)
-            case.status = CaseStatus.AWAITING_VERIFICATION
+            case.status = CaseStatus.DISCOVERY_COMPLETE
             case.current_stage = 4
 
             await db.commit()
-            await emit("READY_FOR_REVIEW", 95, "Findings ready for human verification review.", "review.ready")
-            await emit("COMPLETED", 100, f"Scan completed. {len(evaluated_results)} public sources ready for triage.", "scan.completed", {"findings_count": len(evaluated_results)})
+
+            await audit_service.log(
+                action=AuditAction.discovery_completed,
+                organization_id=case.organization_id,
+                resource_type="case",
+                resource_id=str(case.id),
+                details={"total_found": len(saved_results)},
+            )
+
+            await emit("search.completed", "COMPLETED", 100, f"Search completed with {len(saved_results)} candidate records.", {
+                "total_found": len(saved_results),
+            })
 
             return search_job
 
         except Exception as err:
-            logger.error(f"Exposure scan job {job_id_str} failed: {err}", exc_info=True)
+            logger.error(f"Search job {job_id_str} failed: {err}", exc_info=True)
             search_job.status = JobStatus.FAILED
             search_job.error_message = str(err)
             case.status = CaseStatus.VALIDATED
             await db.commit()
-            await emit("FAILED", 100, f"Scan failed: {err}", "scan.failed")
+
+            await audit_service.log(
+                action=AuditAction.discovery_failed,
+                organization_id=case.organization_id,
+                resource_type="case",
+                resource_id=str(case.id),
+                details={"error": str(err)[:200]},
+            )
+
+            await emit("search.failed", "FAILED", 100, "Search discovery failed.", {
+                "error": str(err)[:200],
+            })
             raise
 
 

@@ -18,6 +18,7 @@ import {
   Zap,
 } from "lucide-react";
 import { api } from "../../services/api";
+import { formatErrorMessage, safeRenderText } from "../../utils/errorUtils";
 
 interface MonitoringRunItem {
   id: string;
@@ -77,7 +78,7 @@ export const MonitoringView: React.FC<MonitoringViewProps> = ({
     } catch (err: any) {
       console.error("Failed to load monitoring status:", err);
       setErrorMessage(
-        err.response?.data?.detail || "Failed to load continuous monitoring configuration."
+        formatErrorMessage(err, "Failed to load continuous monitoring configuration.")
       );
     } finally {
       setIsLoading(false);
@@ -107,7 +108,7 @@ export const MonitoringView: React.FC<MonitoringViewProps> = ({
       await fetchMonitoringStatus();
     } catch (err: any) {
       console.error("Failed to update monitoring:", err);
-      setErrorMessage(err.response?.data?.detail || "Failed to update monitoring state.");
+      setErrorMessage(formatErrorMessage(err, "Failed to update monitoring state."));
     } finally {
       setIsActionLoading(false);
     }
@@ -118,17 +119,14 @@ export const MonitoringView: React.FC<MonitoringViewProps> = ({
       setIsScanning(true);
       setErrorMessage(null);
       setSuccessMessage(null);
-      const res = await api.post(`/investigations/${caseId}/monitoring/scan`);
-      const delta = res.data.delta || {};
+      const res = await api.post(`/investigations/${caseId}/monitoring/scan-now`);
       setSuccessMessage(
-        `Monitoring re-scan complete! Discovered ${delta.new_count || 0} new candidate(s), ${
-          delta.unchanged_count || 0
-        } unchanged, ${delta.not_observed_count || 0} unobserved.`
+        res.data?.message || "Continuous exposure discovery scan dispatched successfully."
       );
       await fetchMonitoringStatus();
     } catch (err: any) {
       console.error("Manual monitoring scan failed:", err);
-      setErrorMessage(err.response?.data?.detail || "Manual monitoring re-scan failed.");
+      setErrorMessage(formatErrorMessage(err, "Manual monitoring re-scan failed."));
     } finally {
       setIsScanning(false);
     }
@@ -153,7 +151,7 @@ export const MonitoringView: React.FC<MonitoringViewProps> = ({
         <div className="p-4 rounded-xl bg-red-500/10 border border-red-500/20 text-xs text-red-600 dark:text-red-400 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <AlertCircle className="w-4 h-4 shrink-0" />
-            <span>{errorMessage}</span>
+            <span>{safeRenderText(errorMessage)}</span>
           </div>
           <button
             onClick={() => setErrorMessage(null)}

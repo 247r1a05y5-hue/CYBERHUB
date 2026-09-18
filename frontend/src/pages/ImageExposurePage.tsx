@@ -30,6 +30,7 @@ import { InvestigationTimelineView } from "../components/investigation/Investiga
 import { ReportCenterView } from "../components/investigation/ReportCenterView";
 import { MatchComparisonModal, CandidateItem } from "../components/investigation/MatchComparisonModal";
 import { api, getApiUrl } from "../services/api";
+import { formatErrorMessage, safeRenderText } from "../utils/errorUtils";
 
 export const ImageExposurePage: React.FC = () => {
   const [searchParams] = useSearchParams();
@@ -43,6 +44,8 @@ export const ImageExposurePage: React.FC = () => {
   const [viewMode, setViewMode] = useState<"list" | "grid">("list");
 
   const [isProcessing, setIsProcessing] = useState(false);
+  const [searchStage, setSearchStage] = useState<string>("Searching Google Lens Public Web...");
+  const [searchWarning, setSearchWarning] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   // Result state
@@ -263,28 +266,39 @@ export const ImageExposurePage: React.FC = () => {
 
   // Direct Create and Search Public Web
   const handleCreateAndSearch = async () => {
+    console.log("[IMAGE-EXPOSURE] BUTTON_CLICK", { hasFile: !!selectedFile, isAuthorized });
+
     if (!selectedFile) {
+      console.warn("[IMAGE-EXPOSURE] VALIDATION_FAILED: No selectedFile");
       setErrorMessage("Please capture or upload a reference image first.");
       return;
     }
 
     if (!isAuthorized) {
+      console.warn("[IMAGE-EXPOSURE] VALIDATION_FAILED: Not isAuthorized");
       setErrorMessage("Please confirm you are authorized to investigate this image.");
       return;
     }
 
+    console.log("[IMAGE-EXPOSURE] VALIDATION_SUCCESS");
     setIsProcessing(true);
     setErrorMessage(null);
+    setSearchWarning(null);
 
     try {
+      console.log("[IMAGE-EXPOSURE] INVESTIGATION_CREATE_START");
+      setSearchStage("Creating investigation case...");
       const title = `Image Exposure Investigation - ${new Date().toISOString().split("T")[0]}`;
       const caseRes = await api.post("/investigations", {
         title,
         description: "Public reverse-image exposure investigation via Google Lens",
       });
       const newCase = caseRes.data;
+      console.log("[IMAGE-EXPOSURE] INVESTIGATION_CREATE_SUCCESS", { caseId: newCase.id });
       setCreatedCase(newCase);
 
+      console.log("[IMAGE-EXPOSURE] REFERENCE_UPLOAD_START");
+      setSearchStage("Uploading and analyzing reference image...");
       const formData = new FormData();
       formData.append("file", selectedFile);
       formData.append("source_type", "WEBCAM");
@@ -292,6 +306,7 @@ export const ImageExposurePage: React.FC = () => {
 
       const imgRes = await api.post(`/investigations/${newCase.id}/reference-image`, formData);
       const resData = imgRes.data;
+      console.log("[IMAGE-EXPOSURE] REFERENCE_UPLOAD_SUCCESS", { refId: resData.reference_image_id || resData.id });
 
       try {
         await api.post(`/investigations/${newCase.id}/attestation`, {
@@ -300,7 +315,7 @@ export const ImageExposurePage: React.FC = () => {
           reference_image_sha256: resData.sha256_hash || resData.sha256,
         });
       } catch (attErr) {
-        console.warn("Attestation record notice:", attErr);
+        console.warn("[IMAGE-EXPOSURE] ATTESTATION_NOTICE", attErr);
       }
 
       setPipelineResult({
@@ -311,20 +326,38 @@ export const ImageExposurePage: React.FC = () => {
         dimensions: resData.dimensions || { width: 640, height: 480 },
       });
 
+      console.log("[IMAGE-EXPOSURE] SEARCH_REQUEST_START");
+      setSearchStage("Searching Google Lens & public web index...");
       try {
-        await api.post(`/investigations/${newCase.id}/web-search`, {
+        const searchRes = await api.post(`/investigations/${newCase.id}/web-search`, {
           max_results: 25,
           include_similar: true,
         });
-      } catch {
-        // Fallback
+        const searchData = searchRes.data;
+        console.log("[IMAGE-EXPOSURE] SEARCH_REQUEST_SUCCESS", searchData);
+
+        if (searchData.provider_status === "NOT_CONFIGURED") {
+          setSearchWarning("SearchAPI Google Lens key is not configured (SEARCHAPI_API_KEY is empty in .env).");
+        } else if (
+          searchData.provider_status === "REFERENCE_IMAGE_NOT_EXTERNALLY_REACHABLE" ||
+          searchData.error_code === "REFERENCE_IMAGE_NOT_EXTERNALLY_REACHABLE"
+        ) {
+          setSearchWarning(
+            searchData.message ||
+              "SearchAPI requires an externally reachable HTTPS image URL. Localhost URL cannot be fetched directly by external search engine crawlers."
+          );
+        }
+      } catch (searchErr: any) {
+        console.error("[IMAGE-EXPOSURE] SEARCH_REQUEST_ERROR", searchErr);
+        setSearchWarning(formatErrorMessage(searchErr, "Public web search service encountered an error."));
       }
 
       setCurrentStep("discovery");
-      fetchFindings(newCase.id);
+      await fetchFindings(newCase.id);
+      console.log("[IMAGE-EXPOSURE] SEARCH_COMPLETED");
     } catch (err: any) {
-      console.error("Investigation creation failed:", err);
-      setErrorMessage(err.response?.data?.detail || err.message || "Failed to process reference image.");
+      console.error("[IMAGE-EXPOSURE] EXECUTION_FAILED", err);
+      setErrorMessage(formatErrorMessage(err, "Failed to process reference image."));
     } finally {
       setIsProcessing(false);
     }
@@ -365,10 +398,26 @@ export const ImageExposurePage: React.FC = () => {
         <div className="mb-5 p-3.5 rounded-lg bg-[#111111] border border-[#ef4444]/40 text-[#ef4444] text-xs flex items-center justify-between">
           <div className="flex items-center gap-2">
             <AlertCircle className="w-4 h-4 shrink-0" />
-            <span>{errorMessage}</span>
+            <span>{safeRenderText(errorMessage)}</span>
           </div>
           <button
             onClick={() => setErrorMessage(null)}
+            className="text-xs font-semibold hover:underline text-[#B3B3B3]"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {/* Provider Status / Search Warning Notice */}
+      {searchWarning && (
+        <div className="mb-5 p-3.5 rounded-lg bg-[#1C1917] border border-[#F59E0B]/40 text-[#F59E0B] text-xs flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 shrink-0 text-[#F59E0B]" />
+            <span>{safeRenderText(searchWarning)}</span>
+          </div>
+          <button
+            onClick={() => setSearchWarning(null)}
             className="text-xs font-semibold hover:underline text-[#B3B3B3]"
           >
             Dismiss
@@ -419,12 +468,12 @@ export const ImageExposurePage: React.FC = () => {
                 type="button"
                 onClick={handleCreateAndSearch}
                 disabled={isProcessing || !isAuthorized}
-                className="w-full h-11 bg-[#F5F5F5] hover:bg-white text-[#000000] font-semibold text-xs rounded-lg flex items-center justify-center gap-2 active:scale-[0.99] transition-all disabled:opacity-40"
+                className="w-full h-11 bg-[#F5F5F5] hover:bg-white text-[#000000] font-semibold text-xs rounded-lg flex items-center justify-center gap-2 active:scale-[0.99] transition-all disabled:opacity-40 cursor-pointer"
               >
                 {isProcessing ? (
                   <>
                     <Loader2 className="w-4 h-4 animate-spin text-black" />
-                    <span>Searching Google Lens Public Web...</span>
+                    <span>{searchStage || "Searching Google Lens Public Web..."}</span>
                   </>
                 ) : (
                   <>

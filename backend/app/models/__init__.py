@@ -9,6 +9,18 @@ from app.models.audit_log import AuditAction, AuditLog
 from app.models.biometrics import FaceEmbedding, FaceRecord, FaceValidationStatus, ReferenceImage
 from app.models.case import Case, CaseStage, CaseStatus
 from app.models.dataset import Dataset, DatasetIdentity, DatasetStatus, DatasetVersion
+from app.models.participant import (
+    ConsentStatus,
+    DatasetMatch,
+    DatasetVerification,
+    ImageIndexStatus,
+    MatchStatus,
+    Participant,
+    ParticipantConsent,
+    ParticipantImage,
+    ParticipantPublicSource,
+    VerificationStatus as ParticipantVerificationStatus,
+)
 from app.models.discovery import (
     ConfidenceCategory,
     CorrelationCluster,
@@ -34,6 +46,17 @@ from app.models.intelligence import (
     RiskLevel,
     TimelineEvent,
 )
+from app.models.investigation_record import (
+    CandidateImage,
+    CrawlStatus,
+    FetchMethod,
+    HistoricalSnapshot,
+    HistoricalSource,
+    ImageCorrelation,
+    OcrExtraction,
+    PageInvestigation,
+    SnapshotStatus,
+)
 from app.models.note import Note
 from app.models.notification import Notification, NotificationType
 from app.models.organization import Organization
@@ -54,14 +77,33 @@ __all__ = [
     "Case",
     "CaseStage",
     "CaseStatus",
+    "CandidateImage",
+    "CrawlStatus",
+    "FetchMethod",
+    "HistoricalSnapshot",
+    "HistoricalSource",
+    "ImageCorrelation",
+    "OcrExtraction",
+    "PageInvestigation",
+    "SnapshotStatus",
     "Complaint",
     "ComplaintStatus",
     "ConfidenceCategory",
     "CorrelationCluster",
     "Dataset",
     "DatasetIdentity",
+    "DatasetMatch",
     "DatasetStatus",
+    "DatasetVerification",
     "DatasetVersion",
+    "ConsentStatus",
+    "ImageIndexStatus",
+    "MatchStatus",
+    "Participant",
+    "ParticipantConsent",
+    "ParticipantImage",
+    "ParticipantPublicSource",
+    "ParticipantVerificationStatus",
     "Evidence",
     "EvidenceEvent",
     "EvidenceType",

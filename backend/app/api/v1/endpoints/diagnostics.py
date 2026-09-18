@@ -40,6 +40,15 @@ class SearchDiagnosticsResponse(BaseModel):
     public_base_url_host: str
     last_search_run: dict[str, Any] | None = None
     last_error: str | None = None
+    # AWS Rekognition + Controlled Dataset
+    aws_configured: bool = False
+    aws_collection_exists: bool = False
+    aws_region: str | None = None
+    dataset_participant_count: int = 0
+    dataset_image_count: int = 0
+    dataset_indexed_face_count: int = 0
+    last_dataset_match: str | None = None
+    last_aws_error: str | None = None
 
 
 @router.get("/search", response_model=SearchDiagnosticsResponse, summary="Search Provider & Infrastructure Diagnostics")
@@ -139,6 +148,53 @@ async def get_search_diagnostics(
     except Exception as job_err:
         logger.debug(f"Diagnostics failed to query latest search job: {job_err}")
 
+    # 6. AWS Rekognition + Dataset stats
+    from app.services.aws_rekognition_service import rekognition_service
+    from app.models.participant import Participant, ParticipantImage, DatasetMatch, ImageIndexStatus
+    from sqlalchemy import func
+
+    aws_configured = rekognition_service.is_configured
+    aws_collection_exists = False
+    aws_region = settings.AWS_REGION
+    last_aws_error: str | None = None
+    dataset_participant_count = 0
+    dataset_image_count = 0
+    dataset_indexed_face_count = 0
+    last_dataset_match_str: str | None = None
+
+    if aws_configured:
+        try:
+            info = rekognition_service.describe_collection()
+            aws_collection_exists = info.status == "ACTIVE"
+        except Exception as aws_err:
+            last_aws_error = str(aws_err)
+
+    try:
+        dataset_participant_count = (
+            await db.execute(select(func.count(Participant.id)).where(Participant.is_active == True))
+        ).scalar() or 0
+        dataset_image_count = (
+            await db.execute(select(func.count(ParticipantImage.id)))
+        ).scalar() or 0
+        dataset_indexed_face_count = (
+            await db.execute(
+                select(func.count(ParticipantImage.id)).where(
+                    ParticipantImage.index_status == ImageIndexStatus.INDEXED
+                )
+            )
+        ).scalar() or 0
+        last_match = (
+            await db.execute(
+                select(DatasetMatch.matched_at)
+                .order_by(DatasetMatch.matched_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if last_match:
+            last_dataset_match_str = last_match.isoformat()
+    except Exception as stats_err:
+        logger.debug(f"Diagnostics failed to query dataset stats: {stats_err}")
+
     return SearchDiagnosticsResponse(
         camera_upload_ready=True,
         database_ready=db_ready,
@@ -151,4 +207,12 @@ async def get_search_diagnostics(
         public_base_url_host=base_host or "unknown",
         last_search_run=last_search_run_info,
         last_error=last_error,
+        aws_configured=aws_configured,
+        aws_collection_exists=aws_collection_exists,
+        aws_region=aws_region,
+        dataset_participant_count=dataset_participant_count,
+        dataset_image_count=dataset_image_count,
+        dataset_indexed_face_count=dataset_indexed_face_count,
+        last_dataset_match=last_dataset_match_str,
+        last_aws_error=last_aws_error,
     )

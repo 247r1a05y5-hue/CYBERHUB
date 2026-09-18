@@ -10,6 +10,7 @@ import {
   Search,
 } from "lucide-react";
 import { api } from "../../services/api";
+import { formatErrorMessage, safeRenderText } from "../../utils/errorUtils";
 
 export interface ProviderStatusInfo {
   name: string;
@@ -170,7 +171,7 @@ export const DiscoveryScanFeed: React.FC<DiscoveryScanFeedProps> = ({
     } catch (err: any) {
       console.error("Web Search error:", err);
       setIsScanning(false);
-      const msg = err.response?.data?.detail || "Public web search unavailable — SearchAPI could not be reached.";
+      const msg = formatErrorMessage(err, "Public web search unavailable — SearchAPI could not be reached.");
       setScanError(msg);
       setEventLogs((prev) => [
         {
@@ -242,7 +243,7 @@ export const DiscoveryScanFeed: React.FC<DiscoveryScanFeedProps> = ({
         <div className="p-3 rounded bg-[#111111] border border-[#ef4444]/40 text-xs text-[#ef4444] flex items-center justify-between">
           <div className="flex items-center gap-2">
             <AlertTriangle className="w-4 h-4 shrink-0" />
-            <span>{scanError}</span>
+            <span>{safeRenderText(scanError)}</span>
           </div>
           <button
             type="button"
@@ -260,7 +261,7 @@ export const DiscoveryScanFeed: React.FC<DiscoveryScanFeedProps> = ({
           <div className="flex items-center justify-between text-[11px] font-mono text-[#B3B3B3]">
             <span className="flex items-center gap-1.5">
               <Loader2 className="w-3 h-3 animate-spin text-[#F5F5F5]" />
-              <span>{currentStep}...</span>
+              <span>{safeRenderText(currentStep)}...</span>
             </span>
             <span>{progressPct}%</span>
           </div>
@@ -284,8 +285,8 @@ export const DiscoveryScanFeed: React.FC<DiscoveryScanFeedProps> = ({
             {eventLogs.map((log) => (
               <div key={log.id} className="flex items-start justify-between gap-2 text-[#B3B3B3]">
                 <span className="text-[#777777]">[{log.timestamp}]</span>
-                <span className="flex-1 text-left text-[#F5F5F5]">{log.message}</span>
-                <span className="text-[#4A4A4A]">{log.step}</span>
+                <span className="flex-1 text-left text-[#F5F5F5]">{safeRenderText(log.message)}</span>
+                <span className="text-[#4A4A4A]">{safeRenderText(log.step)}</span>
               </div>
             ))}
           </div>

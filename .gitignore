@@ -99,4 +99,12 @@ backend/cyberplatform.db
 backend/cyberplatform.db-shm
 backend/cyberplatform.db-wal
 backend/test_output.txt
+# ── ML datasets / runtime artifacts ─────────────────────────────────────────
+backend/data/
+backend/models/
+extracted_frames/
+
+# ── Large local artifacts ────────────────────────────────────────────────────
+*.zip
+*.mp4
 

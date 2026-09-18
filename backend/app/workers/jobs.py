@@ -40,3 +40,17 @@ def job_monitoring_scan(rule_id_str: str) -> dict:
             return {"rule_id": rule_id_str, "before": prev, "now": now, "new": delta}
 
     return run_async(_run())
+
+
+def run_analysis_job(analysis_id_str: str) -> dict:
+    """Async worker job to execute analysis pipeline."""
+    async def _run():
+        async with AsyncSessionLocal() as session:
+            from app.services.analysis_orchestrator import AnalysisOrchestrator
+            orchestrator = AnalysisOrchestrator(session)
+            analysis_id = uuid.UUID(analysis_id_str)
+            finding = await orchestrator.run_pipeline(analysis_id)
+            await session.commit()
+            return {"analysis_id": analysis_id_str, "status": finding.status.value if hasattr(finding, "status") else "COMPLETED"}
+
+    return run_async(_run())

@@ -7,6 +7,7 @@ import {
   CheckCircle2,
   FileImage,
 } from "lucide-react";
+import { formatErrorMessage, safeRenderText } from "../../utils/errorUtils";
 
 export type CameraState =
   | "CAMERA_REQUESTING"
@@ -90,7 +91,7 @@ export const CameraCapture: React.FC<CameraCaptureProps> = ({
         setErrorMessage("No camera hardware was detected on this device.");
       } else {
         setCameraState("CAMERA_ERROR");
-        setErrorMessage(err.message || "Failed to initialize device camera stream.");
+        setErrorMessage(formatErrorMessage(err, "Failed to initialize device camera stream."));
       }
       setActiveTab("upload");
     }
@@ -284,7 +285,7 @@ export const CameraCapture: React.FC<CameraCaptureProps> = ({
             {errorMessage && (
               <div className="mb-4 p-3 rounded bg-[#111111] border border-[#ef4444]/40 max-w-md w-full flex items-start gap-2 text-xs text-[#ef4444] text-left">
                 <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-                <span>{errorMessage}</span>
+                <span>{safeRenderText(errorMessage)}</span>
               </div>
             )}
 
